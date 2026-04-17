@@ -33,7 +33,10 @@ class IngestResponse(BaseModel):
 class MixRequest(BaseModel):
     base_name: str = Field(..., min_length=1)
     sentence: str = Field(..., min_length=1)
-    mix_mode: str = Field(default="context_priority", description="context_priority or all_random")
+    mix_mode: str = Field(
+        default="context_priority",
+        description="context_priority, all_random, nearest_gap, or farthest_gap",
+    )
     output_path: str | None = None
 
 

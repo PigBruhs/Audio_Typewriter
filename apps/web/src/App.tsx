@@ -17,6 +17,8 @@ import {
   requestMix,
 } from "./api";
 
+const MAX_IMPORT_LOG_LINES = 500;
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) {
     return `${bytes} B`;
@@ -66,6 +68,16 @@ function App(): JSX.Element {
   const [importing, setImporting] = useState(false);
   const [exiting, setExiting] = useState(false);
 
+  function appendImportLog(message: string): void {
+    setImportLogs((prev) => {
+      const next = [...prev, message];
+      if (next.length <= MAX_IMPORT_LOG_LINES) {
+        return next;
+      }
+      return next.slice(next.length - MAX_IMPORT_LOG_LINES);
+    });
+  }
+
   useEffect(() => {
     getHealth()
       .then((data) => setHealth(data))
@@ -103,7 +115,7 @@ function App(): JSX.Element {
     } catch (error) {
       if (allowMissingAsPending && error instanceof ApiError && error.status === 404) {
         setSelectedStats(null);
-        setImportLogs((prev) => [...prev, `[SYSTEM] Base '${base}' is queued and not materialized yet. Continue processing...`]);
+        appendImportLog(`[SYSTEM] Base '${base}' is queued and not materialized yet. Continue processing...`);
         return;
       }
       throw error;
@@ -131,7 +143,7 @@ function App(): JSX.Element {
     try {
       const onStreamEvent = (streamEvent: ImportStreamEvent) => {
         if (streamEvent.type === "status") {
-          setImportLogs((prev) => [...prev, `[SYSTEM] ${streamEvent.message}`]);
+          appendImportLog(`[SYSTEM] ${streamEvent.message}`);
         }
         if (streamEvent.type === "task") {
           setTasks((prev) => {
@@ -139,56 +151,41 @@ function App(): JSX.Element {
             next.unshift(streamEvent.task);
             return next;
           });
-          setImportLogs((prev) => [
-            ...prev,
-            `${formatStage(streamEvent.task.stage)} Task created: ${streamEvent.task.task_id}`,
-          ]);
+          appendImportLog(`${formatStage(streamEvent.task.stage)} Task created: ${streamEvent.task.task_id}`);
         }
         if (streamEvent.type === "vad_start") {
           setImportProgressCurrent(streamEvent.processed_audio_sec);
           setImportProgressTotal(streamEvent.total_audio_sec);
-          setImportLogs((prev) => [
-            ...prev,
-            `[VAD] start: ${streamEvent.processed_audio_sec.toFixed(1)}s / ${streamEvent.total_audio_sec.toFixed(1)}s`,
-          ]);
+          appendImportLog(`[VAD] start: ${streamEvent.processed_audio_sec.toFixed(1)}s / ${streamEvent.total_audio_sec.toFixed(1)}s`);
         }
         if (streamEvent.type === "vad_progress") {
           setImportProgressCurrent(streamEvent.processed_audio_sec);
           setImportProgressTotal(streamEvent.total_audio_sec);
-          setImportLogs((prev) => [
-            ...prev,
-            `[VAD] ${streamEvent.processed_audio_sec.toFixed(1)}s/${streamEvent.total_audio_sec.toFixed(1)}s | ${streamEvent.file_name}`,
-          ]);
+          appendImportLog(`[VAD] ${streamEvent.processed_audio_sec.toFixed(1)}s/${streamEvent.total_audio_sec.toFixed(1)}s | ${streamEvent.file_name}`);
         }
         if (streamEvent.type === "vad_complete") {
           setImportProgressCurrent(streamEvent.processed_audio_sec);
           setImportProgressTotal(streamEvent.total_audio_sec);
-          setImportLogs((prev) => [...prev, "[VAD] completed."]);
+          appendImportLog("[VAD] completed.");
         }
         if (streamEvent.type === "overwrite") {
-          setImportLogs((prev) => [
-            ...prev,
-            `[SYSTEM] Overwrite detected for base=${streamEvent.base_name}. Cleared files=${streamEvent.cleared_audio_files}, cleared indexed sources=${streamEvent.cleared_index_sources}.`,
-          ]);
+          appendImportLog(`[SYSTEM] Overwrite detected for base=${streamEvent.base_name}. Cleared files=${streamEvent.cleared_audio_files}, cleared indexed sources=${streamEvent.cleared_index_sources}.`);
         }
         if (streamEvent.type === "start") {
-          setImportLogs((prev) => [...prev, `[ASR] queued: 0/${streamEvent.total} files`]);
+          appendImportLog(`[ASR] queued: 0/${streamEvent.total} files`);
         }
         if (streamEvent.type === "progress") {
           setImportProgressCurrent(streamEvent.current);
           setImportProgressTotal(streamEvent.total);
-          setImportLogs((prev) => [
-            ...prev,
-            `[ASR] ${streamEvent.current}/${streamEvent.total} | ${streamEvent.file_name} | tokens=${streamEvent.token_count}`,
-          ]);
+          appendImportLog(`[ASR] ${streamEvent.current}/${streamEvent.total} | ${streamEvent.file_name} | tokens=${streamEvent.token_count}`);
         }
         if (streamEvent.type === "complete") {
           setImportProgressCurrent(streamEvent.result.ingested_source_count);
           setImportProgressTotal(streamEvent.result.ingested_source_count);
-          setImportLogs((prev) => [...prev, "[SYSTEM] Import request completed (ASR continues in queue)."]);
+          appendImportLog("[SYSTEM] Import request completed (ASR continues in queue).");
         }
         if (streamEvent.type === "error") {
-          setImportLogs((prev) => [...prev, `[ERROR] ${streamEvent.detail}`]);
+          appendImportLog(`[ERROR] ${streamEvent.detail}`);
         }
       };
 
@@ -200,7 +197,7 @@ function App(): JSX.Element {
         `Imported base=${data.base_name}, ${overwriteLabel}, files=${data.audio_count}, duration=${data.total_duration_sec.toFixed(1)}s, size=${formatBytes(data.total_file_size_bytes)}, tokens=${data.token_count}`
       );
       if (data.discarded_task_count && data.discarded_task_count > 0) {
-        setImportLogs((prev) => [...prev, `Overwrite discarded old unfinished tasks: ${data.discarded_task_count}`]);
+        appendImportLog(`Overwrite discarded old unfinished tasks: ${data.discarded_task_count}`);
       }
       await refreshBases();
       await refreshTasks();
@@ -242,7 +239,7 @@ function App(): JSX.Element {
       await deleteQueueTask(taskId);
       await refreshTasks();
       await refreshBases();
-      setImportLogs((prev) => [...prev, `[SYSTEM] Deleted task ${taskId} and purged base ${baseName}.`]);
+      appendImportLog(`[SYSTEM] Deleted task ${taskId} and purged base ${baseName}.`);
     } catch (error) {
       setResult(error instanceof Error ? error.message : "Delete task failed");
     }
@@ -348,7 +345,6 @@ function App(): JSX.Element {
             <progress value={importProgressCurrent} max={importProgressTotal} style={{ width: "100%" }} />
           </div>
         )}
-        {importLogs.length > 0 && <pre style={{ maxHeight: 180, overflow: "auto" }}>{importLogs.join("\n")}</pre>}
         {importResult && <pre>{importResult}</pre>}
       </section>
 
@@ -374,8 +370,10 @@ function App(): JSX.Element {
       <h2>Create Mix</h2>
       <form onSubmit={onSubmit}>
         <select value={mixMode} onChange={(event) => setMixMode(event.target.value)} style={{ width: "100%", marginBottom: 8 }}>
-          <option value="context_priority">Context Priority (same sentence first)</option>
+          <option value="context_priority">Context Priority (same/adjacent clip first)</option>
           <option value="all_random">All Random</option>
+          <option value="nearest_gap">Nearest Gap Priority</option>
+          <option value="farthest_gap">Farthest Gap Priority</option>
         </select>
         <textarea
           rows={4}
@@ -419,7 +417,6 @@ function App(): JSX.Element {
                   />
                 </>
               )}
-              <div>Tokens indexed: {task.token_count}</div>
               {task.last_error && <div style={{ color: "crimson" }}>Error: {task.last_error}</div>}
               {task.status === "running" && (
                 <button type="button" onClick={() => onPauseTask(task.task_id)}>Pause</button>
@@ -434,6 +431,16 @@ function App(): JSX.Element {
           ))}
         </section>
       )}
+
+      <section style={{ marginTop: 20 }}>
+        <h2>Console</h2>
+        <div style={{ fontSize: 13, color: "#666", marginBottom: 6 }}>
+          Runtime logs from import/VAD/ASR pipeline.
+        </div>
+        <pre style={{ maxHeight: 220, overflow: "auto", background: "#111", color: "#ddd", padding: 10 }}>
+          {importLogs.length > 0 ? importLogs.join("\n") : "[SYSTEM] No logs yet."}
+        </pre>
+      </section>
     </main>
   );
 }

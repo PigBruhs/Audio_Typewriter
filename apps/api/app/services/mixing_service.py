@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -24,6 +25,8 @@ class MixPlan:
 
 
 class MixingService:
+    _MIX_MODES = {"context_priority", "all_random", "nearest_gap", "farthest_gap"}
+
     def __init__(
         self,
         database: SQLiteDatabase | None = None,
@@ -39,14 +42,23 @@ class MixingService:
         candidates,
         previous_source_audio_id: str | None,
         previous_segment_index: int | None,
+        previous_start_sec: float | None,
         mix_mode: str,
         rng: random.Random,
     ):
+        if mix_mode not in self._MIX_MODES:
+            raise ValueError("mix_mode must be one of: context_priority, all_random, nearest_gap, farthest_gap")
+
         if mix_mode == "all_random":
             return rng.choice(candidates)
 
-        if mix_mode != "context_priority":
-            raise ValueError("mix_mode must be one of: context_priority, all_random")
+        if mix_mode in {"nearest_gap", "farthest_gap"}:
+            if previous_source_audio_id is None or previous_start_sec is None:
+                return rng.choice(candidates)
+            sampled = candidates
+            if len(candidates) > 5:
+                sampled = rng.sample(candidates, 5)
+            return self._pick_by_gap(sampled, previous_source_audio_id, previous_start_sec, mix_mode, rng)
 
         if previous_source_audio_id is not None and previous_segment_index is not None:
             same_segment = [
@@ -59,11 +71,93 @@ class MixingService:
             if same_segment:
                 return rng.choice(same_segment)
 
+            adjacent_segment = [
+                candidate
+                for candidate in candidates
+                if self._is_same_or_adjacent_source(previous_source_audio_id, candidate.source_audio_id)
+                and candidate.segment_index >= 0
+                and candidate.segment_index == previous_segment_index
+            ]
+            if adjacent_segment:
+                return rng.choice(adjacent_segment)
+
             same_source = [candidate for candidate in candidates if candidate.source_audio_id == previous_source_audio_id]
             if same_source:
                 return rng.choice(same_source)
 
+            adjacent_source = [
+                candidate for candidate in candidates if self._is_same_or_adjacent_source(previous_source_audio_id, candidate.source_audio_id)
+            ]
+            if adjacent_source:
+                return rng.choice(adjacent_source)
+
         return rng.choice(candidates)
+
+    def _source_sequence(self, source_audio_id: str) -> int | None:
+        match = re.search(r"(\d+)$", source_audio_id)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    def _is_same_or_adjacent_source(self, left_source: str, right_source: str) -> bool:
+        if left_source == right_source:
+            return True
+        left_seq = self._source_sequence(left_source)
+        right_seq = self._source_sequence(right_source)
+        if left_seq is None or right_seq is None:
+            return False
+        return abs(left_seq - right_seq) == 1
+
+    def _gap_tuple(
+        self,
+        previous_source_audio_id: str,
+        previous_start_sec: float,
+        candidate_source_audio_id: str,
+        candidate_start_sec: float,
+    ) -> tuple[int, int, int]:
+        previous_seq = self._source_sequence(previous_source_audio_id)
+        candidate_seq = self._source_sequence(candidate_source_audio_id)
+        if previous_seq is None or candidate_seq is None:
+            audio_gap = 10**9
+        else:
+            # Keep audio gap strictly positive for robust ordering.
+            audio_gap = max(1, abs(previous_seq - candidate_seq))
+
+        previous_min = int(previous_start_sec // 60)
+        previous_sec = int(previous_start_sec) % 60
+        candidate_min = int(candidate_start_sec // 60)
+        candidate_sec = int(candidate_start_sec) % 60
+        minute_delta = previous_min - candidate_min
+        second_delta = previous_sec - candidate_sec
+        return audio_gap, minute_delta, second_delta
+
+    def _pick_by_gap(self, candidates, previous_source_audio_id: str, previous_start_sec: float, mix_mode: str, rng: random.Random):
+        ranked = []
+        for candidate in candidates:
+            audio_gap, minute_delta, second_delta = self._gap_tuple(
+                previous_source_audio_id,
+                previous_start_sec,
+                candidate.source_audio_id,
+                candidate.start_sec,
+            )
+            ranked.append(
+                (
+                    audio_gap,
+                    abs(minute_delta),
+                    abs(second_delta),
+                    rng.random(),
+                    candidate,
+                )
+            )
+
+        if mix_mode == "nearest_gap":
+            ranked.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        else:
+            ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
+        return ranked[0][4]
 
     def build_mix_plan(
         self,
@@ -72,8 +166,8 @@ class MixingService:
         job_id: str | None = None,
         mix_mode: str = "context_priority",
     ) -> MixPlan:
-        if mix_mode not in {"context_priority", "all_random"}:
-            raise ValueError("mix_mode must be one of: context_priority, all_random")
+        if mix_mode not in self._MIX_MODES:
+            raise ValueError("mix_mode must be one of: context_priority, all_random, nearest_gap, farthest_gap")
 
         tokens = tokenize_sentence(sentence)
         if not tokens:
@@ -85,6 +179,7 @@ class MixingService:
         rng = random.Random(job_id or sentence)
         previous_source_audio_id: str | None = None
         previous_segment_index: int | None = None
+        previous_start_sec: float | None = None
 
         for search_result in token_search_results:
             if not search_result.candidates:
@@ -94,6 +189,7 @@ class MixingService:
                 search_result.candidates,
                 previous_source_audio_id,
                 previous_segment_index,
+                previous_start_sec,
                 mix_mode,
                 rng,
             )
@@ -106,6 +202,7 @@ class MixingService:
             items.append(item)
             previous_source_audio_id = selected.source_audio_id
             previous_segment_index = selected.segment_index
+            previous_start_sec = selected.start_sec
 
         return MixPlan(
             job_id=job_id or str(uuid.uuid4()),
