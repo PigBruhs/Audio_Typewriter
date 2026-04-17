@@ -1,0 +1,39 @@
+[project]
+name = "audio-typewriter"
+version = "0.1.0"
+description = "Sentence mixing toolkit with ASR indexing and audio stitching"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "python-multipart>=0.0.9",
+  "faster-whisper>=1.0.3",
+]
+
+[project.optional-dependencies]
+worker = [
+  "dramatiq[redis]>=1.17.0",
+  "redis>=5.0.0",
+]
+web = []
+dev = [
+  "pytest>=8.2.0",
+  "httpx>=0.27.0",
+  "ruff>=0.6.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "apps/api",
+  "packages/core",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+

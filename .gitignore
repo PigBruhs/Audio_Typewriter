@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+
+# IDE
+.idea/
+.vscode/
+
+# Runtime
+*.db
+*.sqlite3
+uploads/
+artifacts/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
