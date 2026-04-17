@@ -49,6 +49,10 @@ export type QueueTask = {
   task_id: string;
   base_name: string;
   status: string;
+  stage?: string;
+  ready_for_asr?: boolean;
+  vad_total_audio_sec?: number;
+  vad_processed_audio_sec?: number;
   total_files: number;
   processed_files: number;
   next_sequence_number: number;
@@ -64,6 +68,7 @@ export type QueueTask = {
 
 export type ImportStreamEvent =
   | { type: "status"; message: string }
+  | { type: "task"; task: QueueTask }
   | { type: "overwrite"; base_name: string; cleared_audio_files: number; cleared_index_sources: number }
   | { type: "vad_start"; base_name: string; total_audio_sec: number; processed_audio_sec: number }
   | { type: "vad_progress"; base_name: string; file_name: string; total_audio_sec: number; processed_audio_sec: number }
@@ -72,6 +77,15 @@ export type ImportStreamEvent =
   | { type: "progress"; base_name: string; current: number; total: number; file_name: string; token_count: number }
   | { type: "complete"; result: AudioBaseImportResponse }
   | { type: "error"; detail: string };
+
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
 
 async function readErrorDetail(response: Response): Promise<string> {
   try {
@@ -134,7 +148,7 @@ export async function listAudioBases(): Promise<AudioBaseItem[]> {
 export async function getAudioBaseStats(baseName: string): Promise<AudioBaseItem> {
   const response = await fetch(`/api/v1/audio-bases/${encodeURIComponent(baseName)}/stats`);
   if (!response.ok) {
-    throw new Error(`Get base stats failed: ${await readErrorDetail(response)}`);
+    throw new ApiError(`Get base stats failed: ${await readErrorDetail(response)}`, response.status);
   }
   return (await response.json()) as AudioBaseItem;
 }
@@ -255,6 +269,15 @@ export async function resumeQueueTask(taskId: string): Promise<QueueTask> {
     throw new Error(`Resume task failed: ${await readErrorDetail(response)}`);
   }
   return (await response.json()) as QueueTask;
+}
+
+export async function deleteQueueTask(taskId: string): Promise<void> {
+  const response = await fetch(`/api/v1/tasks/${encodeURIComponent(taskId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(`Delete task failed: ${await readErrorDetail(response)}`);
+  }
 }
 
 export async function requestSystemExit(): Promise<void> {

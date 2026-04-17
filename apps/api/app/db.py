@@ -244,6 +244,15 @@ class SQLiteDatabase:
         finally:
             connection.close()
 
+    def delete_audio_base(self, base_name: str) -> int:
+        connection = self.connect()
+        try:
+            cursor = connection.execute("DELETE FROM audio_bases WHERE base_name = ?", (base_name,))
+            connection.commit()
+            return int(cursor.rowcount or 0)
+        finally:
+            connection.close()
+
     def replace_occurrences(self, source_audio_id: str, occurrences: Iterable[WordOccurrenceRecord]) -> int:
         occurrence_rows = list(occurrences)
         connection = self.connect()

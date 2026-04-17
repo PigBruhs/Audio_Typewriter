@@ -4,6 +4,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -39,6 +42,9 @@ class AudioBaseService:
     def base_path(self, base_name: str) -> Path:
         return self.settings.audio_base_dir / base_name
 
+    def vad_job_dir(self, task_id: str) -> Path:
+        return self.settings.temp_dir / "vad_jobs" / task_id
+
     def base_exists(self, base_name: str) -> bool:
         return self.base_path(base_name).exists()
 
@@ -49,6 +55,9 @@ class AudioBaseService:
         removed_file_count = sum(1 for path in target_dir.rglob("*") if path.is_file())
         shutil.rmtree(target_dir, ignore_errors=True)
         return removed_file_count
+
+    def clear_vad_job_storage(self, task_id: str) -> None:
+        shutil.rmtree(self.vad_job_dir(task_id), ignore_errors=True)
 
     def _probe_duration(self, file_path: Path) -> float:
         command = [
@@ -171,6 +180,88 @@ class AudioBaseService:
             )
         return normalized_path
 
+    def stage_vad_sources(self, task_id: str, files: list[UploadFile]) -> tuple[str, list[dict[str, object]], float]:
+        filtered = [file for file in files if Path(file.filename or "").suffix.lower() in _ALLOWED_EXTENSIONS]
+        if not filtered:
+            raise ValueError("No .wav or .mp3 files were provided.")
+
+        filtered.sort(key=lambda item: (item.filename or "").lower())
+        job_dir = self.vad_job_dir(task_id)
+        source_dir = job_dir / "sources"
+        source_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest: list[dict[str, object]] = []
+        total_audio_sec = 0.0
+        for index, upload in enumerate(filtered, start=1):
+            suffix = Path(upload.filename or "").suffix.lower() or ".wav"
+            saved_name = f"{index:06d}{suffix}"
+            source_path = source_dir / saved_name
+            upload.file.seek(0)
+            with source_path.open("wb") as destination:
+                shutil.copyfileobj(upload.file, destination)
+            duration_sec = self._probe_duration(source_path)
+            total_audio_sec += duration_sec
+            manifest.append(
+                {
+                    "index": index,
+                    "file_name": saved_name,
+                    "duration_sec": duration_sec,
+                }
+            )
+
+        (job_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(source_dir), manifest, round(total_audio_sec, 3)
+
+    def load_vad_manifest(self, task_id: str) -> list[dict[str, object]]:
+        manifest_path = self.vad_job_dir(task_id) / "manifest.json"
+        if not manifest_path.exists():
+            return []
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    def split_source_file_into_base_clips(
+        self,
+        source_path: Path,
+        *,
+        base_name: str,
+        sequence_start: int,
+        created_at: str,
+        checkpoint_callback: Callable[[], None] | None = None,
+    ) -> tuple[list[AudioBaseFileRecord], int]:
+        target_dir = self.base_path(base_name)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return self._split_upload_into_speech_clips(
+            source_path,
+            base_name=base_name,
+            target_dir=target_dir,
+            sequence_start=sequence_start,
+            created_at=created_at,
+            checkpoint_callback=checkpoint_callback,
+        )
+
+    def collect_base_records(self, base_name: str, created_at: str) -> list[AudioBaseFileRecord]:
+        base_dir = self.base_path(base_name)
+        records: list[AudioBaseFileRecord] = []
+        for path in sorted(base_dir.glob("*.wav"), key=lambda item: int(item.stem) if item.stem.isdigit() else 0):
+            if not path.stem.isdigit():
+                continue
+            seq = int(path.stem)
+            records.append(
+                AudioBaseFileRecord(
+                    source_audio_id=f"{base_name}:{seq:06d}",
+                    base_name=base_name,
+                    sequence_number=seq,
+                    file_name=path.name,
+                    file_path=str(path),
+                    duration_sec=self._probe_duration(path),
+                    file_size_bytes=path.stat().st_size,
+                    created_at=created_at,
+                )
+            )
+        return records
+
     def _split_upload_into_speech_clips(
         self,
         source_path: Path,
@@ -179,6 +270,7 @@ class AudioBaseService:
         target_dir: Path,
         sequence_start: int,
         created_at: str,
+        checkpoint_callback: Callable[[], None] | None = None,
     ) -> tuple[list[AudioBaseFileRecord], int]:
         work_dir = source_path.parent
         vad_source = self._normalize_audio_for_vad(source_path, work_dir)
@@ -186,6 +278,8 @@ class AudioBaseService:
         records: list[AudioBaseFileRecord] = []
         sequence = sequence_start
         for start_sec, end_sec in self._detect_speech_segments(vad_source):
+            if checkpoint_callback:
+                checkpoint_callback()
             target_name = f"{sequence:06d}.wav"
             target_path = target_dir / target_name
             self._export_segment_clip(source_path, target_path, start_sec, end_sec)
@@ -212,6 +306,7 @@ class AudioBaseService:
         base_name: str,
         files: list[UploadFile],
         progress_callback: Callable[[dict[str, object]], None] | None = None,
+        checkpoint_callback: Callable[[], None] | None = None,
     ) -> tuple[AudioBaseRecord, list[AudioBaseFileRecord]]:
         self.settings.ensure_directories()
         base_name = self.validate_base_name(base_name)
@@ -229,6 +324,55 @@ class AudioBaseService:
         now = datetime.now(timezone.utc).isoformat()
         records: list[AudioBaseFileRecord] = []
         sequence = 1
+        vad_processed_sec = 0.0
+        vad_last_sequence = 0
+        vad_lock = threading.Lock()
+        vad_stop_event = threading.Event()
+        vad_progress_interval_sec = 2.0
+
+        def _accumulate_new_vad_duration() -> bool:
+            nonlocal vad_processed_sec, vad_last_sequence
+            latest_sequence = 0
+            for path in target_dir.glob("*.wav"):
+                stem = path.stem
+                if stem.isdigit():
+                    latest_sequence = max(latest_sequence, int(stem))
+            if latest_sequence <= vad_last_sequence:
+                return False
+
+            increment = 0.0
+            for current_sequence in range(vad_last_sequence + 1, latest_sequence + 1):
+                clip_path = target_dir / f"{current_sequence:06d}.wav"
+                if not clip_path.exists():
+                    continue
+                increment += self._probe_duration(clip_path)
+
+            vad_processed_sec = round(vad_processed_sec + increment, 3)
+            vad_last_sequence = latest_sequence
+            return True
+
+        def _emit_vad_progress(total_audio_sec: float) -> None:
+            if not progress_callback:
+                return
+            safe_total = max(total_audio_sec, vad_processed_sec, 0.001)
+            progress_callback(
+                {
+                    "type": "vad_progress",
+                    "base_name": base_name,
+                    "file_name": f"{vad_last_sequence:06d}.wav",
+                    "processed_audio_sec": vad_processed_sec,
+                    "total_audio_sec": round(safe_total, 3),
+                }
+            )
+
+        def _vad_progress_worker(total_audio_sec: float) -> None:
+            while not vad_stop_event.wait(vad_progress_interval_sec):
+                with vad_lock:
+                    changed = _accumulate_new_vad_duration()
+                    if not changed:
+                        continue
+                    _emit_vad_progress(total_audio_sec)
+
         try:
             with tempfile.TemporaryDirectory(
                 prefix="audio_typewriter_raw_",
@@ -246,44 +390,54 @@ class AudioBaseService:
                     prepared_sources.append((source_path, source_duration, raw_name.name))
 
                 total_audio_sec = round(sum(duration for _path, duration, _name in prepared_sources), 3)
-                processed_audio_sec = 0.0
+                vad_progress_thread: threading.Thread | None = None
                 if progress_callback:
                     progress_callback(
                         {
                             "type": "vad_start",
                             "base_name": base_name,
                             "total_audio_sec": total_audio_sec,
-                            "processed_audio_sec": processed_audio_sec,
+                            "processed_audio_sec": 0.0,
                         }
                     )
-                for source_path, source_duration, source_name in prepared_sources:
+                    vad_progress_thread = threading.Thread(
+                        target=_vad_progress_worker,
+                        args=(total_audio_sec,),
+                        daemon=True,
+                        name=f"vad-progress-{base_name}",
+                    )
+                    vad_progress_thread.start()
+                for source_path, _source_duration, _source_name in prepared_sources:
+                    if checkpoint_callback:
+                        checkpoint_callback()
                     split_records, sequence = self._split_upload_into_speech_clips(
                         source_path,
                         base_name=base_name,
                         target_dir=target_dir,
                         sequence_start=sequence,
                         created_at=now,
+                        checkpoint_callback=checkpoint_callback,
                     )
                     records.extend(split_records)
-                    processed_audio_sec = round(processed_audio_sec + source_duration, 3)
-                    if progress_callback:
-                        progress_callback(
-                            {
-                                "type": "vad_progress",
-                                "base_name": base_name,
-                                "file_name": source_name,
-                                "processed_audio_sec": processed_audio_sec,
-                                "total_audio_sec": total_audio_sec,
-                            }
-                        )
+                    with vad_lock:
+                        if _accumulate_new_vad_duration():
+                            _emit_vad_progress(total_audio_sec)
+
+                vad_stop_event.set()
+                if vad_progress_thread is not None:
+                    vad_progress_thread.join(timeout=1.0)
+                with vad_lock:
+                    if _accumulate_new_vad_duration():
+                        _emit_vad_progress(total_audio_sec)
 
                 if progress_callback:
+                    safe_total = max(total_audio_sec, vad_processed_sec, 0.001)
                     progress_callback(
                         {
                             "type": "vad_complete",
                             "base_name": base_name,
-                            "processed_audio_sec": processed_audio_sec,
-                            "total_audio_sec": total_audio_sec,
+                            "processed_audio_sec": vad_processed_sec,
+                            "total_audio_sec": round(safe_total, 3),
                         }
                     )
 

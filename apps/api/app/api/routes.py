@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from queue import Empty, Queue
 from typing import Callable
 
@@ -42,7 +43,7 @@ _asr_service = ASRService()
 _audio_base_service = AudioBaseService()
 _index_service = IndexService(_database)
 _mixing_service = MixingService(_database, _index_service)
-_task_queue_service = TaskQueueService(_database, _asr_service, _index_service)
+_task_queue_service = TaskQueueService(_database, _asr_service, _index_service, _audio_base_service)
 
 
 def _iter_with_tqdm(file_records, base_name: str):
@@ -86,37 +87,62 @@ def _run_audio_base_import(
                 }
             )
 
-    base_record, file_records = _audio_base_service.import_audio_files_with_progress(
-        base_name=normalized_base_name,
-        files=files,
-        progress_callback=progress_callback,
-    )
-    _database.create_audio_base(base_record)
-    _database.replace_audio_base_files(base_record.base_name, file_records)
-
-    total_files = len(file_records)
-    for _index, _file_record in _iter_with_tqdm(file_records, base_record.base_name):
-        pass
+    task_id = str(uuid.uuid4())
+    source_dir, manifest, total_audio_sec = _audio_base_service.stage_vad_sources(task_id, files)
 
     queued_task = _task_queue_service.enqueue_import_task(
-        base_name=base_record.base_name,
-        total_files=total_files,
+        base_name=normalized_base_name,
+        total_files=0,
+        vad_source_dir=source_dir,
+        vad_total_sources=len(manifest),
+        vad_total_audio_sec=total_audio_sec,
         model_tier="large",
         overwritten=overwritten,
         cleared_audio_files=cleared_audio_files,
         cleared_index_sources=cleared_index_sources,
+        task_id=task_id,
+    )
+    if progress_callback:
+        progress_callback({"type": "task", "task": queued_task})
+
+    def _forward_progress(payload: dict[str, object]) -> None:
+        event_type = str(payload.get("type", ""))
+        if event_type in {"vad_start", "vad_progress", "vad_complete"}:
+            processed = float(payload.get("processed_audio_sec", 0.0))
+            total = float(payload.get("total_audio_sec", 0.0))
+            try:
+                _task_queue_service.update_vad_progress(
+                    task_id,
+                    processed_audio_sec=processed,
+                    total_audio_sec=total,
+                )
+            except ValueError:
+                pass
+        if progress_callback:
+            progress_callback(payload)
+
+    _forward_progress(
+        {
+            "type": "vad_start",
+            "base_name": normalized_base_name,
+            "total_audio_sec": total_audio_sec,
+            "processed_audio_sec": 0.0,
+        }
     )
 
-    stats = _audio_base_service.summarize_records(base_record.base_name, file_records)
+    stats = _database.get_audio_base_stats(normalized_base_name) or _audio_base_service.summarize_records(
+        normalized_base_name,
+        [],
+    )
     response = AudioBaseImportResponse(
-        base_name=stats.base_name,
+        base_name=normalized_base_name,
         overwritten=overwritten,
         cleared_audio_files=cleared_audio_files,
         cleared_index_sources=cleared_index_sources,
-        audio_count=stats.audio_count,
-        total_duration_sec=stats.total_duration_sec,
-        total_file_size_bytes=stats.total_file_size_bytes,
-        ingested_source_count=len(file_records),
+        audio_count=int(stats.audio_count if hasattr(stats, "audio_count") else 0),
+        total_duration_sec=float(stats.total_duration_sec if hasattr(stats, "total_duration_sec") else 0.0),
+        total_file_size_bytes=int(stats.total_file_size_bytes if hasattr(stats, "total_file_size_bytes") else 0),
+        ingested_source_count=0,
         token_count=0,
         task_id=str(queued_task["task_id"]),
         task_status=str(queued_task["status"]),
@@ -126,11 +152,11 @@ def _run_audio_base_import(
         progress_callback(
             {
                 "type": "status",
-                "message": "VAD and file import completed. ASR task is queued; pause/resume in Tasks tab.",
+                "message": "Import task queued. VAD/ASR will run in background; pause/resume in Tasks tab.",
             }
         )
         progress_callback(
-            {"type": "start", "base_name": base_record.base_name, "total": total_files}
+            {"type": "start", "base_name": normalized_base_name, "total": len(manifest)}
         )
         progress_callback({"type": "complete", "result": response.model_dump()})
     return response
@@ -216,8 +242,17 @@ def resume_task(task_id: str) -> dict[str, object]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.delete("/tasks/{task_id}")
+def delete_task(task_id: str) -> dict[str, object]:
+    try:
+        return _task_queue_service.delete_task(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/system/exit")
 def system_exit() -> dict[str, str]:
+    result = _task_queue_service.prepare_for_shutdown(wait_timeout_sec=5.0)
     _task_queue_service.flush()
 
     def _shutdown() -> None:
@@ -225,7 +260,11 @@ def system_exit() -> dict[str, str]:
         os._exit(0)
 
     threading.Thread(target=_shutdown, daemon=True).start()
-    return {"status": "shutting_down"}
+    return {
+        "status": "shutting_down",
+        "paused_running": str(result.get("paused_running", 0)),
+        "remaining_running": str(result.get("remaining_running", 0)),
+    }
 
 
 @router.get("/audio-bases", response_model=list[AudioBaseListItem])

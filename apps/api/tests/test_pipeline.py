@@ -10,11 +10,12 @@ from fastapi import UploadFile
 
 from app.core.config import Settings
 from app.db import SQLiteDatabase
-from app.models import AudioBaseFileRecord, AudioSourceRecord, MixPlanItem, WordOccurrenceRecord
+from app.models import AudioBaseFileRecord, AudioBaseRecord, AudioSourceRecord, MixPlanItem, WordOccurrenceRecord
 from app.services.asr_service import ASRService
 from app.services.audio_base_service import AudioBaseService
 from app.services.index_service import IndexService
 from app.services.mixing_service import MixingService
+from app.services.task_queue_service import QueueTask, TaskQueueService
 
 
 class PipelineTests(unittest.TestCase):
@@ -188,6 +189,7 @@ class PipelineTests(unittest.TestCase):
             target_dir: Path,
             sequence_start: int,
             created_at: str,
+            checkpoint_callback=None,
         ) -> tuple[list[AudioBaseFileRecord], int]:
             target_name = f"{sequence_start:06d}.wav"
             target_path = target_dir / target_name
@@ -266,6 +268,150 @@ class PipelineTests(unittest.TestCase):
         segments = [MixPlanItem(token="bad", source_audio_id="demo_base:000001", start_sec=0.8, end_sec=0.8)]
         with self.assertRaises(ValueError):
             self.mixing_service.stitch_segments(base_name="demo_base", segments=segments)
+
+    def test_task_queue_load_preserves_asr_checkpoint_after_restart(self) -> None:
+        queue_path = self.settings.data_dir / "asr_task_queue.json"
+        queue_path.parent.mkdir(parents=True, exist_ok=True)
+        queue_path.write_text(
+            """
+            [
+              {
+                "task_id": "task-1",
+                "base_name": "demo_base",
+                "status": "running",
+                "total_files": 10,
+                "processed_files": 4,
+                "next_sequence_number": 5,
+                "token_count": 100,
+                "stage": "asr",
+                "ready_for_asr": true,
+                "vad_total_audio_sec": 12.0,
+                "vad_processed_audio_sec": 12.0,
+                "vad_source_dir": null,
+                "vad_total_sources": 0,
+                "vad_next_source_index": 1,
+                "vad_next_sequence_number": 1,
+                "vad_created_at": "2026-01-01T00:00:00+00:00",
+                "model_tier": "large",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "last_error": null,
+                "overwritten": false,
+                "cleared_audio_files": 0,
+                "cleared_index_sources": 0
+              }
+            ]
+            """.strip(),
+            encoding="utf-8",
+        )
+
+        queue_service = TaskQueueService(self.database, ASRService(self.settings), self.index_service, self.audio_base_service, self.settings)
+        tasks = queue_service.list_tasks()
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["status"], "paused")
+        self.assertEqual(tasks[0]["stage"], "asr")
+        self.assertEqual(tasks[0]["next_sequence_number"], 5)
+
+    def test_prepare_for_shutdown_pauses_running_tasks(self) -> None:
+        queue_service = TaskQueueService(self.database, ASRService(self.settings), self.index_service, self.audio_base_service, self.settings)
+        now = "2026-01-01T00:00:00+00:00"
+        running_task = QueueTask(
+            task_id="task-run",
+            base_name="demo_base",
+            status="running",
+            total_files=5,
+            processed_files=1,
+            next_sequence_number=2,
+            token_count=10,
+            stage="asr",
+            ready_for_asr=True,
+            vad_total_audio_sec=5.0,
+            vad_processed_audio_sec=5.0,
+            vad_source_dir=None,
+            vad_total_sources=0,
+            vad_next_source_index=1,
+            vad_next_sequence_number=1,
+            vad_created_at=now,
+            model_tier="large",
+            created_at=now,
+            updated_at=now,
+        )
+        with queue_service._condition:
+            queue_service._tasks = [running_task]
+            queue_service._save_tasks()
+
+        result = queue_service.prepare_for_shutdown(wait_timeout_sec=0.2)
+        tasks = queue_service.list_tasks()
+        self.assertEqual(result["paused_running"], 1)
+        self.assertEqual(tasks[0]["status"], "paused")
+
+    def test_delete_task_purges_temp_db_and_audio_base(self) -> None:
+        queue_service = TaskQueueService(self.database, ASRService(self.settings), self.index_service, self.audio_base_service, self.settings)
+        now = "2026-01-01T00:00:00+00:00"
+
+        base_dir = self.settings.audio_base_dir / "demo_base"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        clip_path = base_dir / "000001.wav"
+        clip_path.write_bytes(b"wav")
+
+        self.database.create_audio_base(
+            AudioBaseRecord(
+                base_name="demo_base",
+                base_path=str(base_dir),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        self.database.upsert_audio_source(
+            AudioSourceRecord(
+                source_audio_id="demo_base:000001",
+                base_name="demo_base",
+                source_path=str(clip_path),
+                language="en",
+                model_tier="large",
+                device="cpu",
+                compute_type="int8",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+        task_id = "task-delete"
+        vad_job_dir = self.settings.temp_dir / "vad_jobs" / task_id
+        vad_job_dir.mkdir(parents=True, exist_ok=True)
+        (vad_job_dir / "manifest.json").write_text("[]", encoding="utf-8")
+
+        task = QueueTask(
+            task_id=task_id,
+            base_name="demo_base",
+            status="paused",
+            total_files=0,
+            processed_files=0,
+            next_sequence_number=1,
+            token_count=0,
+            stage="vad",
+            ready_for_asr=True,
+            vad_total_audio_sec=0.0,
+            vad_processed_audio_sec=0.0,
+            vad_source_dir=str(vad_job_dir / "sources"),
+            vad_total_sources=0,
+            vad_next_source_index=1,
+            vad_next_sequence_number=1,
+            vad_created_at=now,
+            model_tier="large",
+            created_at=now,
+            updated_at=now,
+        )
+        with queue_service._condition:
+            queue_service._tasks = [task]
+            queue_service._save_tasks()
+
+        queue_service.delete_task(task_id)
+        self.assertEqual(queue_service.list_tasks(), [])
+        self.assertFalse(base_dir.exists())
+        self.assertFalse(vad_job_dir.exists())
+        self.assertIsNone(self.database.get_audio_base_stats("demo_base"))
+        self.assertIsNone(self.database.get_audio_source_path("demo_base:000001"))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 import { ChangeEvent, FormEvent, useEffect, useState } from "react";
 import {
+  ApiError,
   AudioBaseItem,
+  deleteQueueTask,
   getAudioBaseStats,
   getHealth,
   HealthResponse,
@@ -26,6 +28,22 @@ function formatBytes(bytes: number): string {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function formatStage(stage?: string): string {
+  if (stage === "vad") {
+    return "[VAD]";
+  }
+  if (stage === "asr") {
+    return "[ASR]";
+  }
+  return "[UNKNOWN]";
+}
+
+function clampProgress(current: number, total: number): { value: number; max: number } {
+  const safeMax = Math.max(total, 0.001);
+  const safeValue = Math.min(Math.max(current, 0), safeMax);
+  return { value: safeValue, max: safeMax };
 }
 
 function App(): JSX.Element {
@@ -74,8 +92,21 @@ function App(): JSX.Element {
     if (!selectedBase && data.length > 0) {
       const first = data[0].base_name;
       setSelectedBase(first);
-      const stats = await getAudioBaseStats(first);
+      await loadBaseStats(first, true);
+    }
+  }
+
+  async function loadBaseStats(base: string, allowMissingAsPending: boolean): Promise<void> {
+    try {
+      const stats = await getAudioBaseStats(base);
       setSelectedStats(stats);
+    } catch (error) {
+      if (allowMissingAsPending && error instanceof ApiError && error.status === 404) {
+        setSelectedStats(null);
+        setImportLogs((prev) => [...prev, `[SYSTEM] Base '${base}' is queued and not materialized yet. Continue processing...`]);
+        return;
+      }
+      throw error;
     }
   }
 
@@ -96,17 +127,29 @@ function App(): JSX.Element {
     setImportProgressCurrent(0);
     setImportProgressTotal(0);
     setImportLogs([]);
+    await refreshTasks();
     try {
       const onStreamEvent = (streamEvent: ImportStreamEvent) => {
         if (streamEvent.type === "status") {
-          setImportLogs((prev) => [...prev, streamEvent.message]);
+          setImportLogs((prev) => [...prev, `[SYSTEM] ${streamEvent.message}`]);
+        }
+        if (streamEvent.type === "task") {
+          setTasks((prev) => {
+            const next = prev.filter((task) => task.task_id !== streamEvent.task.task_id);
+            next.unshift(streamEvent.task);
+            return next;
+          });
+          setImportLogs((prev) => [
+            ...prev,
+            `${formatStage(streamEvent.task.stage)} Task created: ${streamEvent.task.task_id}`,
+          ]);
         }
         if (streamEvent.type === "vad_start") {
           setImportProgressCurrent(streamEvent.processed_audio_sec);
           setImportProgressTotal(streamEvent.total_audio_sec);
           setImportLogs((prev) => [
             ...prev,
-            `VAD start: ${streamEvent.processed_audio_sec.toFixed(1)}s / ${streamEvent.total_audio_sec.toFixed(1)}s`,
+            `[VAD] start: ${streamEvent.processed_audio_sec.toFixed(1)}s / ${streamEvent.total_audio_sec.toFixed(1)}s`,
           ]);
         }
         if (streamEvent.type === "vad_progress") {
@@ -114,38 +157,38 @@ function App(): JSX.Element {
           setImportProgressTotal(streamEvent.total_audio_sec);
           setImportLogs((prev) => [
             ...prev,
-            `VAD ${streamEvent.processed_audio_sec.toFixed(1)}s/${streamEvent.total_audio_sec.toFixed(1)}s | ${streamEvent.file_name}`,
+            `[VAD] ${streamEvent.processed_audio_sec.toFixed(1)}s/${streamEvent.total_audio_sec.toFixed(1)}s | ${streamEvent.file_name}`,
           ]);
         }
         if (streamEvent.type === "vad_complete") {
           setImportProgressCurrent(streamEvent.processed_audio_sec);
           setImportProgressTotal(streamEvent.total_audio_sec);
-          setImportLogs((prev) => [...prev, "VAD completed."]);
+          setImportLogs((prev) => [...prev, "[VAD] completed."]);
         }
         if (streamEvent.type === "overwrite") {
           setImportLogs((prev) => [
             ...prev,
-            `Overwrite detected for base=${streamEvent.base_name}. Cleared files=${streamEvent.cleared_audio_files}, cleared indexed sources=${streamEvent.cleared_index_sources}.`,
+            `[SYSTEM] Overwrite detected for base=${streamEvent.base_name}. Cleared files=${streamEvent.cleared_audio_files}, cleared indexed sources=${streamEvent.cleared_index_sources}.`,
           ]);
         }
         if (streamEvent.type === "start") {
-          setImportLogs((prev) => [...prev, `ASR queued: 0/${streamEvent.total} files`]);
+          setImportLogs((prev) => [...prev, `[ASR] queued: 0/${streamEvent.total} files`]);
         }
         if (streamEvent.type === "progress") {
           setImportProgressCurrent(streamEvent.current);
           setImportProgressTotal(streamEvent.total);
           setImportLogs((prev) => [
             ...prev,
-            `ASR ${streamEvent.current}/${streamEvent.total} | ${streamEvent.file_name} | tokens=${streamEvent.token_count}`,
+            `[ASR] ${streamEvent.current}/${streamEvent.total} | ${streamEvent.file_name} | tokens=${streamEvent.token_count}`,
           ]);
         }
         if (streamEvent.type === "complete") {
           setImportProgressCurrent(streamEvent.result.ingested_source_count);
           setImportProgressTotal(streamEvent.result.ingested_source_count);
-          setImportLogs((prev) => [...prev, "Import completed."]);
+          setImportLogs((prev) => [...prev, "[SYSTEM] Import request completed (ASR continues in queue)."]);
         }
         if (streamEvent.type === "error") {
-          setImportLogs((prev) => [...prev, `Error: ${streamEvent.detail}`]);
+          setImportLogs((prev) => [...prev, `[ERROR] ${streamEvent.detail}`]);
         }
       };
 
@@ -162,8 +205,7 @@ function App(): JSX.Element {
       await refreshBases();
       await refreshTasks();
       setSelectedBase(data.base_name);
-      const stats = await getAudioBaseStats(data.base_name);
-      setSelectedStats(stats);
+      await loadBaseStats(data.base_name, true);
     } catch (error) {
       setImportResult(error instanceof Error ? error.message : "Import failed");
     } finally {
@@ -189,6 +231,23 @@ function App(): JSX.Element {
     }
   }
 
+  async function onDeleteTask(taskId: string, baseName: string) {
+    const confirmed = window.confirm(
+      `Delete task and purge related data for base '${baseName}'? This removes temp, DB index, and audio_base files.`
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await deleteQueueTask(taskId);
+      await refreshTasks();
+      await refreshBases();
+      setImportLogs((prev) => [...prev, `[SYSTEM] Deleted task ${taskId} and purged base ${baseName}.`]);
+    } catch (error) {
+      setResult(error instanceof Error ? error.message : "Delete task failed");
+    }
+  }
+
   async function onExit() {
     setExiting(true);
     try {
@@ -210,8 +269,7 @@ function App(): JSX.Element {
       return;
     }
     try {
-      const stats = await getAudioBaseStats(nextBase);
-      setSelectedStats(stats);
+      await loadBaseStats(nextBase, true);
     } catch (error) {
       setResult(error instanceof Error ? error.message : "Get base stats failed");
     }
@@ -341,8 +399,26 @@ function App(): JSX.Element {
           {tasks.length === 0 && <div>No tasks yet.</div>}
           {tasks.map((task) => (
             <div key={task.task_id} style={{ border: "1px solid #ccc", padding: 8, marginBottom: 8 }}>
-              <div><strong>{task.base_name}</strong> [{task.status}]</div>
-              <div>Progress: {task.processed_files}/{task.total_files}, next={task.next_sequence_number}</div>
+              <div><strong>{task.base_name}</strong> [{task.status}] {formatStage(task.stage)}</div>
+              {task.stage === "vad" ? (
+                <>
+                  <div>
+                    VAD Progress: {(task.vad_processed_audio_sec ?? 0).toFixed(1)}s/{(task.vad_total_audio_sec ?? 0).toFixed(1)}s
+                  </div>
+                  <progress
+                    {...clampProgress(task.vad_processed_audio_sec ?? 0, task.vad_total_audio_sec ?? 0)}
+                    style={{ width: "100%", marginTop: 4 }}
+                  />
+                </>
+              ) : (
+                <>
+                  <div>ASR Progress: {task.processed_files}/{task.total_files}, next={task.next_sequence_number}</div>
+                  <progress
+                    {...clampProgress(task.processed_files, task.total_files)}
+                    style={{ width: "100%", marginTop: 4 }}
+                  />
+                </>
+              )}
               <div>Tokens indexed: {task.token_count}</div>
               {task.last_error && <div style={{ color: "crimson" }}>Error: {task.last_error}</div>}
               {task.status === "running" && (
@@ -351,6 +427,9 @@ function App(): JSX.Element {
               {(task.status === "paused" || task.status === "failed" || task.status === "queued") && (
                 <button type="button" onClick={() => onResumeTask(task.task_id)}>Resume</button>
               )}
+              <button type="button" onClick={() => onDeleteTask(task.task_id, task.base_name)} style={{ marginLeft: 8 }}>
+                Delete
+              </button>
             </div>
           ))}
         </section>
