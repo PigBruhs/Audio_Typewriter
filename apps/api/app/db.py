@@ -183,6 +183,67 @@ class SQLiteDatabase:
             connection.close()
         return len(rows)
 
+    def list_audio_base_files(self, base_name: str, start_sequence_number: int = 1) -> list[AudioBaseFileRecord]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT source_audio_id, base_name, sequence_number, file_name, file_path,
+                       duration_sec, file_size_bytes, created_at
+                FROM audio_base_files
+                WHERE base_name = ? AND sequence_number >= ?
+                ORDER BY sequence_number ASC
+                """,
+                (base_name, start_sequence_number),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        return [
+            AudioBaseFileRecord(
+                source_audio_id=row["source_audio_id"],
+                base_name=row["base_name"],
+                sequence_number=int(row["sequence_number"]),
+                file_name=row["file_name"],
+                file_path=row["file_path"],
+                duration_sec=float(row["duration_sec"]),
+                file_size_bytes=int(row["file_size_bytes"]),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def delete_audio_sources_for_base(self, base_name: str) -> int:
+        connection = self.connect()
+        try:
+            cursor = connection.execute("DELETE FROM audio_sources WHERE base_name = ?", (base_name,))
+            connection.commit()
+            return int(cursor.rowcount or 0)
+        finally:
+            connection.close()
+
+    def clear_audio_base_for_overwrite(self, base_name: str) -> dict[str, int]:
+        connection = self.connect()
+        try:
+            source_row = connection.execute(
+                "SELECT COUNT(1) AS c FROM audio_sources WHERE base_name = ?",
+                (base_name,),
+            ).fetchone()
+            file_row = connection.execute(
+                "SELECT COUNT(1) AS c FROM audio_base_files WHERE base_name = ?",
+                (base_name,),
+            ).fetchone()
+
+            connection.execute("DELETE FROM audio_sources WHERE base_name = ?", (base_name,))
+            connection.execute("DELETE FROM audio_base_files WHERE base_name = ?", (base_name,))
+            connection.commit()
+            return {
+                "cleared_index_sources": int(source_row["c"] if source_row else 0),
+                "cleared_base_files": int(file_row["c"] if file_row else 0),
+            }
+        finally:
+            connection.close()
+
     def replace_occurrences(self, source_audio_id: str, occurrences: Iterable[WordOccurrenceRecord]) -> int:
         occurrence_rows = list(occurrences)
         connection = self.connect()
@@ -343,6 +404,19 @@ class SQLiteDatabase:
             row = connection.execute(
                 "SELECT source_path FROM audio_sources WHERE source_audio_id = ?",
                 (source_audio_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return str(row["source_path"])
+
+    def get_audio_source_path_for_base(self, source_audio_id: str, base_name: str) -> str | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "SELECT source_path FROM audio_sources WHERE source_audio_id = ? AND base_name = ?",
+                (source_audio_id, base_name),
             ).fetchone()
         finally:
             connection.close()

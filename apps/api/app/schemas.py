@@ -46,6 +46,19 @@ class MixResponse(BaseModel):
     token_count: int = 0
 
 
+class ClipSegmentRequest(BaseModel):
+    source_audio_id: str = Field(..., min_length=1)
+    start_sec: float = Field(..., ge=0)
+    end_sec: float = Field(..., gt=0)
+    label: str | None = None
+
+
+class StitchRequest(BaseModel):
+    base_name: str = Field(..., min_length=1)
+    segments: list[ClipSegmentRequest] = Field(..., min_length=1)
+    output_path: str | None = None
+
+
 class ModelDownloadRequest(BaseModel):
     language: str = Field(default="en")
     model_tier: str = Field(default="large")
@@ -62,11 +75,17 @@ class ModelDownloadResponse(BaseModel):
 
 class AudioBaseImportResponse(BaseModel):
     base_name: str
+    overwritten: bool = False
+    cleared_audio_files: int = 0
+    cleared_index_sources: int = 0
     audio_count: int
     total_duration_sec: float
     total_file_size_bytes: int
     ingested_source_count: int
     token_count: int
+    task_id: str | None = None
+    task_status: str | None = None
+    discarded_task_count: int = 0
 
 
 class AudioBaseListItem(BaseModel):

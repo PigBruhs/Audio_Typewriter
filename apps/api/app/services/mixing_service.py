@@ -120,7 +120,18 @@ class MixingService:
             f"asetpts=PTS-STARTPTS,aresample=44100,aformat=channel_layouts=mono[a{index}]"
         )
 
-    def render_plan(self, plan: MixPlan, output_path: str | Path | None = None) -> str:
+    def _validate_manual_segment(self, item: MixPlanItem) -> None:
+        if item.start_sec < 0:
+            raise ValueError(f"Invalid segment for {item.source_audio_id}: start_sec must be >= 0")
+        if item.end_sec <= item.start_sec:
+            raise ValueError(f"Invalid segment for {item.source_audio_id}: end_sec must be > start_sec")
+
+    def render_plan(
+        self,
+        plan: MixPlan,
+        output_path: str | Path | None = None,
+        base_name: str | None = None,
+    ) -> str:
         if not plan.items:
             raise ValueError("No mixable tokens were found.")
 
@@ -130,7 +141,10 @@ class MixingService:
 
         command = [self.settings.ffmpeg_binary, "-y"]
         for item in plan.items:
-            source_path = self.database.get_audio_source_path(item.source_audio_id)
+            if base_name:
+                source_path = self.database.get_audio_source_path_for_base(item.source_audio_id, base_name)
+            else:
+                source_path = self.database.get_audio_source_path(item.source_audio_id)
             if not source_path:
                 raise ValueError(f"Audio source not found for id: {item.source_audio_id}")
             command.extend(["-i", source_path])
@@ -159,6 +173,52 @@ class MixingService:
                 f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             )
         return str(target_path)
+
+    def stitch_segments(
+        self,
+        base_name: str,
+        segments: list[MixPlanItem],
+        output_path: str | Path | None = None,
+    ) -> MixResult:
+        if not segments:
+            raise ValueError("At least one segment is required.")
+
+        for segment in segments:
+            self._validate_manual_segment(segment)
+
+        job_id = str(uuid.uuid4())
+        plan = MixPlan(
+            job_id=job_id,
+            tokens=[segment.token for segment in segments],
+            items=segments,
+            missing_tokens=[],
+        )
+
+        now = datetime.now(timezone.utc).isoformat()
+        job_record = MixJobRecord(
+            job_id=job_id,
+            sentence="[manual-stitch]",
+            status="queued",
+            output_path=None,
+            missing_tokens="[]",
+            created_at=now,
+            updated_at=now,
+        )
+        self.database.create_mix_job(job_record)
+
+        rendered_path = self.render_plan(plan, output_path=output_path, base_name=base_name)
+        job_record.status = "completed"
+        job_record.output_path = rendered_path
+        job_record.updated_at = datetime.now(timezone.utc).isoformat()
+        self.database.create_mix_job(job_record)
+        return MixResult(
+            job_id=job_id,
+            status="completed",
+            output_path=rendered_path,
+            missing_tokens=[],
+            base_name=base_name,
+            token_count=len(segments),
+        )
 
     def mix_sentence(
         self,
@@ -194,7 +254,7 @@ class MixingService:
                 token_count=len(plan.items),
             )
 
-        rendered_path = self.render_plan(plan, output_path=output_path)
+        rendered_path = self.render_plan(plan, output_path=output_path, base_name=base_name)
         job_record.status = "completed"
         job_record.output_path = rendered_path
         job_record.missing_tokens = missing_json

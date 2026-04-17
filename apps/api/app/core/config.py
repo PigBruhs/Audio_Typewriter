@@ -23,6 +23,7 @@ class Settings:
         ffprobe_binary: str | None = None,
         mix_output_dir: str | Path | None = None,
         audio_base_dir: str | Path | None = None,
+        temp_dir: str | Path | None = None,
         max_candidates_per_token: int | None = None,
     ) -> None:
         self.app_name = app_name or os.getenv("AT_APP_NAME", "Audio Typewriter API")
@@ -42,6 +43,7 @@ class Settings:
         self.ffprobe_binary = ffprobe_binary or os.getenv("AT_FFPROBE_BINARY", "ffprobe")
         self.mix_output_dir = Path(mix_output_dir or os.getenv("AT_MIX_OUTPUT_DIR", "artifacts/mixes"))
         self.audio_base_dir = Path(audio_base_dir or os.getenv("AT_AUDIO_BASE_DIR", "audio_base"))
+        self.temp_dir = Path(temp_dir or os.getenv("AT_TEMP_DIR", "./temp"))
         self.max_candidates_per_token = int(
             max_candidates_per_token or os.getenv("AT_MAX_CANDIDATES_PER_TOKEN", "8")
         )
@@ -56,6 +58,7 @@ class Settings:
         self.asr_model_cache_dir.mkdir(parents=True, exist_ok=True)
         self.mix_output_dir.mkdir(parents=True, exist_ok=True)
         self.audio_base_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
 
     def _resolve_local_model_candidate(self, candidate: str) -> str | None:
         value = (candidate or "").strip()

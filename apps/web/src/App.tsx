@@ -1,5 +1,19 @@
 import { ChangeEvent, FormEvent, useEffect, useState } from "react";
-import { AudioBaseItem, getAudioBaseStats, getHealth, HealthResponse, importAudioBase, listAudioBases, requestMix } from "./api";
+import {
+  AudioBaseItem,
+  getAudioBaseStats,
+  getHealth,
+  HealthResponse,
+  importAudioBaseStream,
+  ImportStreamEvent,
+  listQueueTasks,
+  listAudioBases,
+  pauseQueueTask,
+  QueueTask,
+  requestSystemExit,
+  resumeQueueTask,
+  requestMix,
+} from "./api";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) {
@@ -15,6 +29,7 @@ function formatBytes(bytes: number): string {
 }
 
 function App(): JSX.Element {
+  const [activeTab, setActiveTab] = useState<"workbench" | "tasks">("workbench");
   const [baseName, setBaseName] = useState("");
   const [baseFiles, setBaseFiles] = useState<File[]>([]);
   const [bases, setBases] = useState<AudioBaseItem[]>([]);
@@ -25,8 +40,13 @@ function App(): JSX.Element {
   const [sentence, setSentence] = useState("");
   const [result, setResult] = useState<string>("");
   const [importResult, setImportResult] = useState<string>("");
+  const [importProgressCurrent, setImportProgressCurrent] = useState(0);
+  const [importProgressTotal, setImportProgressTotal] = useState(0);
+  const [importLogs, setImportLogs] = useState<string[]>([]);
+  const [tasks, setTasks] = useState<QueueTask[]>([]);
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [exiting, setExiting] = useState(false);
 
   useEffect(() => {
     getHealth()
@@ -36,6 +56,16 @@ function App(): JSX.Element {
     refreshBases().catch((error: unknown) => {
       setResult(error instanceof Error ? error.message : "Load bases failed");
     });
+
+    const timer = window.setInterval(() => {
+      refreshTasks().catch((_error) => {
+        // Keep polling resilient; surface errors only on explicit actions.
+      });
+    }, 1200);
+
+    return () => {
+      window.clearInterval(timer);
+    };
   }, []);
 
   async function refreshBases(): Promise<void> {
@@ -49,6 +79,11 @@ function App(): JSX.Element {
     }
   }
 
+  async function refreshTasks(): Promise<void> {
+    const data = await listQueueTasks();
+    setTasks(data);
+  }
+
   async function onImportSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!baseName.trim() || baseFiles.length === 0) {
@@ -58,12 +93,74 @@ function App(): JSX.Element {
 
     setImporting(true);
     setImportResult("");
+    setImportProgressCurrent(0);
+    setImportProgressTotal(0);
+    setImportLogs([]);
     try {
-      const data = await importAudioBase(baseName.trim(), baseFiles);
+      const onStreamEvent = (streamEvent: ImportStreamEvent) => {
+        if (streamEvent.type === "status") {
+          setImportLogs((prev) => [...prev, streamEvent.message]);
+        }
+        if (streamEvent.type === "vad_start") {
+          setImportProgressCurrent(streamEvent.processed_audio_sec);
+          setImportProgressTotal(streamEvent.total_audio_sec);
+          setImportLogs((prev) => [
+            ...prev,
+            `VAD start: ${streamEvent.processed_audio_sec.toFixed(1)}s / ${streamEvent.total_audio_sec.toFixed(1)}s`,
+          ]);
+        }
+        if (streamEvent.type === "vad_progress") {
+          setImportProgressCurrent(streamEvent.processed_audio_sec);
+          setImportProgressTotal(streamEvent.total_audio_sec);
+          setImportLogs((prev) => [
+            ...prev,
+            `VAD ${streamEvent.processed_audio_sec.toFixed(1)}s/${streamEvent.total_audio_sec.toFixed(1)}s | ${streamEvent.file_name}`,
+          ]);
+        }
+        if (streamEvent.type === "vad_complete") {
+          setImportProgressCurrent(streamEvent.processed_audio_sec);
+          setImportProgressTotal(streamEvent.total_audio_sec);
+          setImportLogs((prev) => [...prev, "VAD completed."]);
+        }
+        if (streamEvent.type === "overwrite") {
+          setImportLogs((prev) => [
+            ...prev,
+            `Overwrite detected for base=${streamEvent.base_name}. Cleared files=${streamEvent.cleared_audio_files}, cleared indexed sources=${streamEvent.cleared_index_sources}.`,
+          ]);
+        }
+        if (streamEvent.type === "start") {
+          setImportLogs((prev) => [...prev, `ASR queued: 0/${streamEvent.total} files`]);
+        }
+        if (streamEvent.type === "progress") {
+          setImportProgressCurrent(streamEvent.current);
+          setImportProgressTotal(streamEvent.total);
+          setImportLogs((prev) => [
+            ...prev,
+            `ASR ${streamEvent.current}/${streamEvent.total} | ${streamEvent.file_name} | tokens=${streamEvent.token_count}`,
+          ]);
+        }
+        if (streamEvent.type === "complete") {
+          setImportProgressCurrent(streamEvent.result.ingested_source_count);
+          setImportProgressTotal(streamEvent.result.ingested_source_count);
+          setImportLogs((prev) => [...prev, "Import completed."]);
+        }
+        if (streamEvent.type === "error") {
+          setImportLogs((prev) => [...prev, `Error: ${streamEvent.detail}`]);
+        }
+      };
+
+      const data = await importAudioBaseStream(baseName.trim(), baseFiles, onStreamEvent);
+      const overwriteLabel = data.overwritten
+        ? `overwrite=yes(cleared files=${data.cleared_audio_files}, cleared indexed sources=${data.cleared_index_sources})`
+        : "overwrite=no";
       setImportResult(
-        `Imported base=${data.base_name}, files=${data.audio_count}, duration=${data.total_duration_sec.toFixed(1)}s, size=${formatBytes(data.total_file_size_bytes)}, tokens=${data.token_count}`
+        `Imported base=${data.base_name}, ${overwriteLabel}, files=${data.audio_count}, duration=${data.total_duration_sec.toFixed(1)}s, size=${formatBytes(data.total_file_size_bytes)}, tokens=${data.token_count}`
       );
+      if (data.discarded_task_count && data.discarded_task_count > 0) {
+        setImportLogs((prev) => [...prev, `Overwrite discarded old unfinished tasks: ${data.discarded_task_count}`]);
+      }
       await refreshBases();
+      await refreshTasks();
       setSelectedBase(data.base_name);
       const stats = await getAudioBaseStats(data.base_name);
       setSelectedStats(stats);
@@ -71,6 +168,37 @@ function App(): JSX.Element {
       setImportResult(error instanceof Error ? error.message : "Import failed");
     } finally {
       setImporting(false);
+    }
+  }
+
+  async function onPauseTask(taskId: string) {
+    try {
+      await pauseQueueTask(taskId);
+      await refreshTasks();
+    } catch (error) {
+      setResult(error instanceof Error ? error.message : "Pause task failed");
+    }
+  }
+
+  async function onResumeTask(taskId: string) {
+    try {
+      await resumeQueueTask(taskId);
+      await refreshTasks();
+    } catch (error) {
+      setResult(error instanceof Error ? error.message : "Resume task failed");
+    }
+  }
+
+  async function onExit() {
+    setExiting(true);
+    try {
+      await requestSystemExit();
+      alert("Backend is shutting down and queue has been flushed. Close the frontend terminal if needed.");
+      window.close();
+    } catch (error) {
+      setResult(error instanceof Error ? error.message : "Exit failed");
+    } finally {
+      setExiting(false);
     }
   }
 
@@ -116,6 +244,13 @@ function App(): JSX.Element {
   return (
     <main style={{ maxWidth: 680, margin: "40px auto", fontFamily: "sans-serif" }}>
       <h1>Audio Typewriter</h1>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+        <button type="button" onClick={() => setActiveTab("workbench")}>Workbench</button>
+        <button type="button" onClick={() => setActiveTab("tasks")}>Tasks</button>
+        <button type="button" onClick={onExit} disabled={exiting} style={{ marginLeft: "auto" }}>
+          {exiting ? "Exiting..." : "Exit"}
+        </button>
+      </div>
       <p>Import a folder as audio base, then build sentence-mixed clips from that base.</p>
       {health && (
         <p>
@@ -123,6 +258,8 @@ function App(): JSX.Element {
         </p>
       )}
 
+      {activeTab === "workbench" && (
+      <>
       <section style={{ marginBottom: 24 }}>
         <h2>Import Audio Base</h2>
         <form onSubmit={onImportSubmit}>
@@ -145,6 +282,15 @@ function App(): JSX.Element {
             {importing ? "Importing and indexing..." : "Import Base"}
           </button>
         </form>
+        {importing && importProgressTotal > 0 && (
+          <div style={{ marginTop: 8 }}>
+            <div style={{ marginBottom: 4 }}>
+              Progress: {importProgressCurrent}/{importProgressTotal}
+            </div>
+            <progress value={importProgressCurrent} max={importProgressTotal} style={{ width: "100%" }} />
+          </div>
+        )}
+        {importLogs.length > 0 && <pre style={{ maxHeight: 180, overflow: "auto" }}>{importLogs.join("\n")}</pre>}
         {importResult && <pre>{importResult}</pre>}
       </section>
 
@@ -185,6 +331,30 @@ function App(): JSX.Element {
         </button>
       </form>
       {result && <pre>{result}</pre>}
+      </>
+      )}
+
+      {activeTab === "tasks" && (
+        <section>
+          <h2>Task Queue</h2>
+          <p>One ASR indexing task runs at a time. Pause/Resume applies to ASR stage only.</p>
+          {tasks.length === 0 && <div>No tasks yet.</div>}
+          {tasks.map((task) => (
+            <div key={task.task_id} style={{ border: "1px solid #ccc", padding: 8, marginBottom: 8 }}>
+              <div><strong>{task.base_name}</strong> [{task.status}]</div>
+              <div>Progress: {task.processed_files}/{task.total_files}, next={task.next_sequence_number}</div>
+              <div>Tokens indexed: {task.token_count}</div>
+              {task.last_error && <div style={{ color: "crimson" }}>Error: {task.last_error}</div>}
+              {task.status === "running" && (
+                <button type="button" onClick={() => onPauseTask(task.task_id)}>Pause</button>
+              )}
+              {(task.status === "paused" || task.status === "failed" || task.status === "queued") && (
+                <button type="button" onClick={() => onResumeTask(task.task_id)}>Resume</button>
+              )}
+            </div>
+          ))}
+        </section>
+      )}
     </main>
   );
 }

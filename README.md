@@ -10,6 +10,7 @@ Audio_Typewriter is a sentence-mixing toolkit: it transcribes speech to word-lev
 - Default `cuda` ASR selection with automatic fallback to `cpu` when GPU is unavailable.
 - Automatic model download to `./models` (faster-whisper cache root).
 - Audio-base workflow: import a folder from Web UI, normalize filenames under `./audio_base/<base_name>`, then index and mix using internal IDs.
+- Import pipeline uses `Silero VAD` first to remove silence and store only speech clips as numbered files in each base.
 
 ## What Is Already Scaffolded
 
@@ -102,7 +103,8 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/models/download" -Method PO
    - Trigger model download/warmup into `./models`.
 2. `POST /api/v1/audio-bases/import`
    - Multipart form: `base_name` + folder audio files (`.wav`, `.mp3`).
-   - Files are stored as `./audio_base/<base_name>/000001.ext...` and then ingested/indexed.
+   - Existing base with same name is explicitly overwritten: old DB index rows + base files are cleared first.
+   - Files are segmented by Silero VAD and stored as `./audio_base/<base_name>/000001.wav...`, then ingested/indexed.
 3. `GET /api/v1/audio-bases`
    - List available bases with `audio_count`, `total_duration_sec`, `total_file_size_bytes`.
 4. `GET /api/v1/audio-bases/{base_name}/stats`
