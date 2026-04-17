@@ -5,6 +5,11 @@ from pydantic import BaseModel, Field
 
 class HealthResponse(BaseModel):
     status: str = "ok"
+    asr_preferred_device: str
+    asr_resolved_device: str
+    asr_compute_type: str
+    asr_last_device_used: str
+    asr_last_compute_type: str
 
 
 class IngestRequest(BaseModel):

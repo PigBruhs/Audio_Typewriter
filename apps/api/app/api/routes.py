@@ -30,7 +30,15 @@ _mixing_service = MixingService(_database, _index_service)
 
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    return HealthResponse()
+    resolved_device, compute_type = _asr_service.resolve_runtime()
+    return HealthResponse(
+        status="ok",
+        asr_preferred_device=_asr_service.settings.asr_device,
+        asr_resolved_device=resolved_device,
+        asr_compute_type=compute_type,
+        asr_last_device_used=_asr_service.last_device_used,
+        asr_last_compute_type=_asr_service.last_compute_type,
+    )
 
 
 @router.post("/audio-bases/import", response_model=AudioBaseImportResponse)

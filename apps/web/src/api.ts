@@ -7,6 +7,15 @@ export type MixResponse = {
   token_count?: number;
 };
 
+export type HealthResponse = {
+  status: string;
+  asr_preferred_device: string;
+  asr_resolved_device: string;
+  asr_compute_type: string;
+  asr_last_device_used: string;
+  asr_last_compute_type: string;
+};
+
 export type AudioBaseItem = {
   base_name: string;
   audio_count: number;
@@ -23,6 +32,18 @@ export type AudioBaseImportResponse = {
   token_count: number;
 };
 
+async function readErrorDetail(response: Response): Promise<string> {
+  try {
+    const payload = (await response.json()) as { detail?: string };
+    if (payload?.detail) {
+      return payload.detail;
+    }
+  } catch (_error) {
+    // Fall back to HTTP status when body is not JSON.
+  }
+  return `HTTP ${response.status}`;
+}
+
 export async function requestMix(baseName: string, sentence: string, mixMode: string): Promise<MixResponse> {
   const response = await fetch("/api/v1/mix", {
     method: "POST",
@@ -33,16 +54,24 @@ export async function requestMix(baseName: string, sentence: string, mixMode: st
   });
 
   if (!response.ok) {
-    throw new Error(`Mix request failed: ${response.status}`);
+    throw new Error(`Mix request failed: ${await readErrorDetail(response)}`);
   }
 
   return (await response.json()) as MixResponse;
 }
 
+export async function getHealth(): Promise<HealthResponse> {
+  const response = await fetch("/api/v1/health");
+  if (!response.ok) {
+    throw new Error(`Health request failed: ${await readErrorDetail(response)}`);
+  }
+  return (await response.json()) as HealthResponse;
+}
+
 export async function listAudioBases(): Promise<AudioBaseItem[]> {
   const response = await fetch("/api/v1/audio-bases");
   if (!response.ok) {
-    throw new Error(`List audio bases failed: ${response.status}`);
+    throw new Error(`List audio bases failed: ${await readErrorDetail(response)}`);
   }
   return (await response.json()) as AudioBaseItem[];
 }
@@ -50,7 +79,7 @@ export async function listAudioBases(): Promise<AudioBaseItem[]> {
 export async function getAudioBaseStats(baseName: string): Promise<AudioBaseItem> {
   const response = await fetch(`/api/v1/audio-bases/${encodeURIComponent(baseName)}/stats`);
   if (!response.ok) {
-    throw new Error(`Get base stats failed: ${response.status}`);
+    throw new Error(`Get base stats failed: ${await readErrorDetail(response)}`);
   }
   return (await response.json()) as AudioBaseItem;
 }
@@ -67,7 +96,7 @@ export async function importAudioBase(baseName: string, files: File[]): Promise<
     body: form,
   });
   if (!response.ok) {
-    throw new Error(`Import base failed: ${response.status}`);
+    throw new Error(`Import base failed: ${await readErrorDetail(response)}`);
   }
   return (await response.json()) as AudioBaseImportResponse;
 }

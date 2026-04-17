@@ -46,6 +46,12 @@ class PipelineTests(unittest.TestCase):
             "Systran/faster-whisper-large-v3",
         )
 
+    def test_resolve_local_prefixed_model_directory(self) -> None:
+        local_model_dir = self.settings.asr_model_cache_dir / "faster-whisper-large-v3"
+        local_model_dir.mkdir(parents=True, exist_ok=True)
+        resolved = self.settings.resolve_model_name("large", "en")
+        self.assertEqual(Path(resolved), local_model_dir)
+
     def test_model_download_uses_models_cache_dir(self) -> None:
         calls: list[dict[str, str]] = []
 

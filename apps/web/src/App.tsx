@@ -1,5 +1,5 @@
 import { ChangeEvent, FormEvent, useEffect, useState } from "react";
-import { AudioBaseItem, getAudioBaseStats, importAudioBase, listAudioBases, requestMix } from "./api";
+import { AudioBaseItem, getAudioBaseStats, getHealth, HealthResponse, importAudioBase, listAudioBases, requestMix } from "./api";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) {
@@ -18,6 +18,7 @@ function App(): JSX.Element {
   const [baseName, setBaseName] = useState("");
   const [baseFiles, setBaseFiles] = useState<File[]>([]);
   const [bases, setBases] = useState<AudioBaseItem[]>([]);
+  const [health, setHealth] = useState<HealthResponse | null>(null);
   const [selectedBase, setSelectedBase] = useState("");
   const [selectedStats, setSelectedStats] = useState<AudioBaseItem | null>(null);
   const [mixMode, setMixMode] = useState("context_priority");
@@ -28,6 +29,10 @@ function App(): JSX.Element {
   const [importing, setImporting] = useState(false);
 
   useEffect(() => {
+    getHealth()
+      .then((data) => setHealth(data))
+      .catch((error: unknown) => setResult(error instanceof Error ? error.message : "Load health failed"));
+
     refreshBases().catch((error: unknown) => {
       setResult(error instanceof Error ? error.message : "Load bases failed");
     });
@@ -112,6 +117,11 @@ function App(): JSX.Element {
     <main style={{ maxWidth: 680, margin: "40px auto", fontFamily: "sans-serif" }}>
       <h1>Audio Typewriter</h1>
       <p>Import a folder as audio base, then build sentence-mixed clips from that base.</p>
+      {health && (
+        <p>
+          ASR runtime: <strong>{health.asr_resolved_device.toUpperCase()}</strong> ({health.asr_compute_type}) | preferred={health.asr_preferred_device} | last={health.asr_last_device_used}
+        </p>
+      )}
 
       <section style={{ marginBottom: 24 }}>
         <h2>Import Audio Base</h2>

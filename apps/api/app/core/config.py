@@ -57,13 +57,31 @@ class Settings:
         self.mix_output_dir.mkdir(parents=True, exist_ok=True)
         self.audio_base_dir.mkdir(parents=True, exist_ok=True)
 
+    def _resolve_local_model_candidate(self, candidate: str) -> str | None:
+        value = (candidate or "").strip()
+        if not value:
+            return None
+
+        explicit_path = Path(value)
+        if explicit_path.exists():
+            return str(explicit_path)
+
+        local_direct = self.asr_model_cache_dir / value
+        if local_direct.exists():
+            return str(local_direct)
+
+        prefixed = self.asr_model_cache_dir / f"faster-whisper-{value}"
+        if prefixed.exists():
+            return str(prefixed)
+        return None
+
     def resolve_model_name(self, model_tier: str, language: str, model_name: str | None = None) -> str:
         language = (language or "en").lower()
         if language != "en":
             raise ValueError("Current scaffold only supports English ASR.")
 
         if model_name and model_name.strip():
-            return model_name.strip()
+            return self._resolve_local_model_candidate(model_name.strip()) or model_name.strip()
 
         model_tier = (model_tier or self.asr_default_model).strip().lower()
         model_map = {
@@ -76,12 +94,16 @@ class Settings:
             "xxlarge": "large-v3",
         }
         if model_tier in model_map:
-            return model_map[model_tier]
+            mapped_name = model_map[model_tier]
+            return self._resolve_local_model_candidate(mapped_name) or mapped_name
 
         # Allow explicit faster-whisper model names or HuggingFace repo IDs.
+        local_candidate = self._resolve_local_model_candidate(model_tier)
+        if local_candidate:
+            return local_candidate
         if "/" in model_tier or "." in model_tier or "-" in model_tier:
             return model_tier
-        return self.asr_default_model
+        return self._resolve_local_model_candidate(self.asr_default_model) or self.asr_default_model
 
 
 settings = Settings()
