@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import json
+import random
 import subprocess
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
 
 from ..core.config import Settings, settings
 from ..db import SQLiteDatabase
-from ..models import MixJobRecord, MixResult
+from ..models import MixJobRecord, MixPlanItem, MixResult
 from ..text import tokenize_sentence
 from .index_service import IndexService
-from audio_typewriter_core.models import MixPlanItem, WordOccurrence
 
 
 @dataclass(slots=True)
@@ -35,28 +34,78 @@ class MixingService:
         self.database = database or SQLiteDatabase()
         self.index_service = index_service or IndexService(self.database, self.settings)
 
-    def build_mix_plan(self, sentence: str, job_id: str | None = None) -> MixPlan:
+    def _select_candidate(
+        self,
+        candidates,
+        previous_source_audio_id: str | None,
+        previous_segment_index: int | None,
+        mix_mode: str,
+        rng: random.Random,
+    ):
+        if mix_mode == "all_random":
+            return rng.choice(candidates)
+
+        if mix_mode != "context_priority":
+            raise ValueError("mix_mode must be one of: context_priority, all_random")
+
+        if previous_source_audio_id is not None and previous_segment_index is not None:
+            same_segment = [
+                candidate
+                for candidate in candidates
+                if candidate.source_audio_id == previous_source_audio_id
+                and candidate.segment_index >= 0
+                and candidate.segment_index == previous_segment_index
+            ]
+            if same_segment:
+                return rng.choice(same_segment)
+
+            same_source = [candidate for candidate in candidates if candidate.source_audio_id == previous_source_audio_id]
+            if same_source:
+                return rng.choice(same_source)
+
+        return rng.choice(candidates)
+
+    def build_mix_plan(
+        self,
+        sentence: str,
+        base_name: str,
+        job_id: str | None = None,
+        mix_mode: str = "context_priority",
+    ) -> MixPlan:
+        if mix_mode not in {"context_priority", "all_random"}:
+            raise ValueError("mix_mode must be one of: context_priority, all_random")
+
         tokens = tokenize_sentence(sentence)
         if not tokens:
             raise ValueError("Sentence is empty after tokenization.")
 
-        token_search_results = self.index_service.search_tokens(tokens)
+        token_search_results = self.index_service.search_tokens(tokens, base_name=base_name)
         items: list[MixPlanItem] = []
         missing_tokens: list[str] = []
+        rng = random.Random(job_id or sentence)
+        previous_source_audio_id: str | None = None
+        previous_segment_index: int | None = None
 
         for search_result in token_search_results:
             if not search_result.candidates:
                 missing_tokens.append(search_result.token)
                 continue
-            selected = search_result.candidates[0]
-            items.append(
-                MixPlanItem(
-                    token=search_result.token,
-                    source_audio_id=selected.source_audio_id,
-                    start_sec=selected.start_sec,
-                    end_sec=selected.end_sec,
-                )
+            selected = self._select_candidate(
+                search_result.candidates,
+                previous_source_audio_id,
+                previous_segment_index,
+                mix_mode,
+                rng,
             )
+            item = MixPlanItem(
+                token=search_result.token,
+                source_audio_id=selected.source_audio_id,
+                start_sec=selected.start_sec,
+                end_sec=selected.end_sec,
+            )
+            items.append(item)
+            previous_source_audio_id = selected.source_audio_id
+            previous_segment_index = selected.segment_index
 
         return MixPlan(
             job_id=job_id or str(uuid.uuid4()),
@@ -81,7 +130,10 @@ class MixingService:
 
         command = [self.settings.ffmpeg_binary, "-y"]
         for item in plan.items:
-            command.extend(["-i", item.source_audio_id])
+            source_path = self.database.get_audio_source_path(item.source_audio_id)
+            if not source_path:
+                raise ValueError(f"Audio source not found for id: {item.source_audio_id}")
+            command.extend(["-i", source_path])
 
         filters = [self._segment_filter(index, item) for index, item in enumerate(plan.items)]
         if len(plan.items) == 1:
@@ -108,8 +160,14 @@ class MixingService:
             )
         return str(target_path)
 
-    def mix_sentence(self, sentence: str, output_path: str | Path | None = None) -> MixResult:
-        plan = self.build_mix_plan(sentence)
+    def mix_sentence(
+        self,
+        sentence: str,
+        base_name: str,
+        output_path: str | Path | None = None,
+        mix_mode: str = "context_priority",
+    ) -> MixResult:
+        plan = self.build_mix_plan(sentence, base_name=base_name, mix_mode=mix_mode)
         now = datetime.now(timezone.utc).isoformat()
         missing_json = json.dumps(plan.missing_tokens, ensure_ascii=False)
         job_record = MixJobRecord(
@@ -132,6 +190,7 @@ class MixingService:
                 status="failed",
                 output_path=None,
                 missing_tokens=plan.missing_tokens,
+                base_name=base_name,
                 token_count=len(plan.items),
             )
 
@@ -146,5 +205,6 @@ class MixingService:
             status="completed",
             output_path=rendered_path,
             missing_tokens=[],
+            base_name=base_name,
             token_count=len(plan.items),
         )

@@ -20,7 +20,9 @@ class Settings:
         asr_beam_size: int | None = None,
         asr_preload_model: str | None = None,
         ffmpeg_binary: str | None = None,
+        ffprobe_binary: str | None = None,
         mix_output_dir: str | Path | None = None,
+        audio_base_dir: str | Path | None = None,
         max_candidates_per_token: int | None = None,
     ) -> None:
         self.app_name = app_name or os.getenv("AT_APP_NAME", "Audio Typewriter API")
@@ -37,7 +39,9 @@ class Settings:
         self.asr_beam_size = int(asr_beam_size or os.getenv("AT_ASR_BEAM_SIZE", "5"))
         self.asr_preload_model = asr_preload_model or os.getenv("AT_ASR_PRELOAD_MODEL", "")
         self.ffmpeg_binary = ffmpeg_binary or os.getenv("AT_FFMPEG_BINARY", "ffmpeg")
+        self.ffprobe_binary = ffprobe_binary or os.getenv("AT_FFPROBE_BINARY", "ffprobe")
         self.mix_output_dir = Path(mix_output_dir or os.getenv("AT_MIX_OUTPUT_DIR", "artifacts/mixes"))
+        self.audio_base_dir = Path(audio_base_dir or os.getenv("AT_AUDIO_BASE_DIR", "audio_base"))
         self.max_candidates_per_token = int(
             max_candidates_per_token or os.getenv("AT_MAX_CANDIDATES_PER_TOKEN", "8")
         )
@@ -51,6 +55,7 @@ class Settings:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.asr_model_cache_dir.mkdir(parents=True, exist_ok=True)
         self.mix_output_dir.mkdir(parents=True, exist_ok=True)
+        self.audio_base_dir.mkdir(parents=True, exist_ok=True)
 
     def resolve_model_name(self, model_tier: str, language: str, model_name: str | None = None) -> str:
         language = (language or "en").lower()

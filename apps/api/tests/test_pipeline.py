@@ -77,6 +77,7 @@ class PipelineTests(unittest.TestCase):
     def test_index_search_and_mix_plan(self) -> None:
         audio_source = AudioSourceRecord(
             source_audio_id="clip-a.wav",
+            base_name="demo_base",
             source_path="clip-a.wav",
             language="en",
             model_tier="base",
@@ -97,13 +98,14 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(matches[0].candidates[0].normalized_token, "hello")
         self.assertEqual(matches[1].candidates[0].normalized_token, "world")
 
-        plan = self.mixing_service.build_mix_plan("hello world")
+        plan = self.mixing_service.build_mix_plan("hello world", base_name="demo_base")
         self.assertEqual(plan.missing_tokens, [])
         self.assertEqual(len(plan.items), 2)
 
     def test_mix_sentence_reports_missing_tokens(self) -> None:
         audio_source = AudioSourceRecord(
             source_audio_id="clip-b.wav",
+            base_name="demo_base",
             source_path="clip-b.wav",
             language="en",
             model_tier="base",
@@ -115,9 +117,53 @@ class PipelineTests(unittest.TestCase):
         occurrences = [WordOccurrenceRecord(None, "clip-b.wav", "hello", "hello", 0.0, 0.2, 0.9, 0, 0)]
         self.index_service.ingest(audio_source, occurrences)
 
-        result = self.mixing_service.mix_sentence("hello missing")
+        result = self.mixing_service.mix_sentence("hello missing", base_name="demo_base")
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.missing_tokens, ["missing"])
+
+    def test_context_priority_prefers_same_source_segment(self) -> None:
+        source_a = AudioSourceRecord(
+            source_audio_id="demo_base:000001",
+            base_name="demo_base",
+            source_path="audio_base/demo_base/000001.wav",
+            language="en",
+            model_tier="base",
+            device="cpu",
+            compute_type="int8",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        source_b = AudioSourceRecord(
+            source_audio_id="demo_base:000002",
+            base_name="demo_base",
+            source_path="audio_base/demo_base/000002.wav",
+            language="en",
+            model_tier="base",
+            device="cpu",
+            compute_type="int8",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        self.index_service.ingest(source_a, [WordOccurrenceRecord(None, "demo_base:000001", "hello", "hello", 0.0, 0.2, 0.95, 0, 0)])
+        self.index_service.ingest(
+            source_b,
+            [
+                WordOccurrenceRecord(None, "demo_base:000002", "world", "world", 0.2, 0.4, 0.99, 1, 0),
+                WordOccurrenceRecord(None, "demo_base:000001", "world", "world", 0.3, 0.5, 0.20, 0, 1),
+            ],
+        )
+
+        plan = self.mixing_service.build_mix_plan(
+            "hello world",
+            base_name="demo_base",
+            mix_mode="context_priority",
+        )
+        self.assertEqual(len(plan.items), 2)
+        self.assertEqual(plan.items[1].source_audio_id, "demo_base:000001")
+
+    def test_invalid_mix_mode_raises_error(self) -> None:
+        with self.assertRaises(ValueError):
+            self.mixing_service.build_mix_plan("hello", base_name="demo_base", mix_mode="unsupported")
 
 
 if __name__ == "__main__":

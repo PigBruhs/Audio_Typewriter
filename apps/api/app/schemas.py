@@ -9,6 +9,8 @@ class HealthResponse(BaseModel):
 
 class IngestRequest(BaseModel):
     source_path: str = Field(..., description="Audio file path")
+    base_name: str | None = Field(default=None, description="Optional audio base name for scoped indexing")
+    source_audio_id: str | None = Field(default=None, description="Optional internal source id")
     language: str = Field(default="en", description="Only English is supported in the first release")
     model_tier: str = Field(default="large", description="tiny, base, small, medium, large")
     model_name: str | None = Field(default=None, description="Explicit faster-whisper model name or HF repo ID")
@@ -16,6 +18,7 @@ class IngestRequest(BaseModel):
 
 class IngestResponse(BaseModel):
     source_audio_id: str
+    base_name: str
     status: str
     token_count: int
     device_used: str
@@ -23,12 +26,15 @@ class IngestResponse(BaseModel):
 
 
 class MixRequest(BaseModel):
+    base_name: str = Field(..., min_length=1)
     sentence: str = Field(..., min_length=1)
+    mix_mode: str = Field(default="context_priority", description="context_priority or all_random")
     output_path: str | None = None
 
 
 class MixResponse(BaseModel):
     job_id: str
+    base_name: str | None = None
     status: str
     output_path: str | None = None
     missing_tokens: list[str] = Field(default_factory=list)
@@ -47,4 +53,28 @@ class ModelDownloadResponse(BaseModel):
     device_used: str
     compute_type: str
     cache_dir: str
+
+
+class AudioBaseImportResponse(BaseModel):
+    base_name: str
+    audio_count: int
+    total_duration_sec: float
+    total_file_size_bytes: int
+    ingested_source_count: int
+    token_count: int
+
+
+class AudioBaseListItem(BaseModel):
+    base_name: str
+    audio_count: int
+    total_duration_sec: float
+    total_file_size_bytes: int
+
+
+class AudioBaseStatsResponse(BaseModel):
+    base_name: str
+    audio_count: int
+    total_duration_sec: float
+    total_file_size_bytes: int
+
 

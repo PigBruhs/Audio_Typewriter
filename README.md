@@ -9,6 +9,7 @@ Audio_Typewriter is a sentence-mixing toolkit: it transcribes speech to word-lev
 - Sentence token search and FFmpeg-based audio stitching.
 - Default `cuda` ASR selection with automatic fallback to `cpu` when GPU is unavailable.
 - Automatic model download to `./models` (faster-whisper cache root).
+- Audio-base workflow: import a folder from Web UI, normalize filenames under `./audio_base/<base_name>`, then index and mix using internal IDs.
 
 ## What Is Already Scaffolded
 
@@ -99,12 +100,25 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/models/download" -Method PO
 
 1. `POST /api/v1/models/download`
    - Trigger model download/warmup into `./models`.
-2. `POST /api/v1/ingest`
-   - Input audio file path, optional `model_tier` or explicit `model_name`.
-   - Run ASR, extract word timestamps, and store token rows.
-3. `POST /api/v1/mix`
-   - Submit a target sentence.
+2. `POST /api/v1/audio-bases/import`
+   - Multipart form: `base_name` + folder audio files (`.wav`, `.mp3`).
+   - Files are stored as `./audio_base/<base_name>/000001.ext...` and then ingested/indexed.
+3. `GET /api/v1/audio-bases`
+   - List available bases with `audio_count`, `total_duration_sec`, `total_file_size_bytes`.
+4. `GET /api/v1/audio-bases/{base_name}/stats`
+   - Query one base summary for UI selection panel.
+5. `POST /api/v1/mix`
+   - Submit a target sentence with `base_name`.
    - Search the index and render a stitched audio file.
+
+### Example mix request
+
+```json
+{
+  "base_name": "speaker_a",
+  "sentence": "hello world"
+}
+```
 
 ## Next Implementation Targets
 

@@ -187,6 +187,8 @@ class ASRService:
     def ingest(
         self,
         source_path: str,
+        source_audio_id: str | None = None,
+        base_name: str | None = None,
         language: str = "en",
         model_tier: str = "large",
         model_name: str | None = None,
@@ -198,9 +200,11 @@ class ASRService:
             model_name=model_name,
         )
         now = datetime.now(timezone.utc).isoformat()
-        source_audio_id = source_path
+        resolved_source_audio_id = source_audio_id or source_path
+        resolved_base_name = (base_name or "").strip()
         source_record = AudioSourceRecord(
-            source_audio_id=source_audio_id,
+            source_audio_id=resolved_source_audio_id,
+            base_name=resolved_base_name,
             source_path=source_path,
             language=language,
             model_tier=model_tier,
@@ -210,9 +214,10 @@ class ASRService:
             updated_at=now,
         )
         for row in occurrences:
-            row.source_audio_id = source_audio_id
+            row.source_audio_id = resolved_source_audio_id
         result = IngestResult(
-            source_audio_id=source_audio_id,
+            source_audio_id=resolved_source_audio_id,
+            base_name=resolved_base_name,
             status="completed",
             token_count=len(occurrences),
             device_used=self.last_device_used,

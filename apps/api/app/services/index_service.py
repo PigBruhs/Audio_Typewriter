@@ -26,13 +26,17 @@ class IndexService:
         self.database.upsert_audio_source(audio_source)
         return self.database.replace_occurrences(audio_source.source_audio_id, occurrences)
 
-    def search_tokens(self, tokens: list[str]) -> list[TokenSearchResult]:
+    def search_tokens(self, tokens: list[str], base_name: str | None = None) -> list[TokenSearchResult]:
         results: list[TokenSearchResult] = []
         for token in tokens:
             normalized = normalize_word(token)
             if not normalized:
                 results.append(TokenSearchResult(token=token, candidates=[]))
                 continue
-            candidates = self.database.search_token(normalized, limit=self.settings.max_candidates_per_token)
+            candidates = self.database.search_token(
+                normalized,
+                limit=self.settings.max_candidates_per_token,
+                base_name=base_name,
+            )
             results.append(TokenSearchResult(token=token, candidates=candidates))
         return results
