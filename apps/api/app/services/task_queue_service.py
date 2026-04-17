@@ -42,8 +42,10 @@ class QueueTask:
     vad_source_dir: str | None
     vad_total_sources: int
     vad_next_source_index: int
+    vad_next_segment_index: int
     vad_next_sequence_number: int
     vad_created_at: str | None
+    asr_last_completed_sequence: int
     model_tier: str
     created_at: str
     updated_at: str
@@ -69,8 +71,10 @@ class QueueTask:
             "vad_source_dir": self.vad_source_dir,
             "vad_total_sources": self.vad_total_sources,
             "vad_next_source_index": self.vad_next_source_index,
+            "vad_next_segment_index": self.vad_next_segment_index,
             "vad_next_sequence_number": self.vad_next_sequence_number,
             "vad_created_at": self.vad_created_at,
+            "asr_last_completed_sequence": self.asr_last_completed_sequence,
             "model_tier": self.model_tier,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -97,8 +101,10 @@ class QueueTask:
             vad_source_dir=(str(payload["vad_source_dir"]) if payload.get("vad_source_dir") else None),
             vad_total_sources=int(payload.get("vad_total_sources", 0)),
             vad_next_source_index=int(payload.get("vad_next_source_index", 1)),
+            vad_next_segment_index=int(payload.get("vad_next_segment_index", 0)),
             vad_next_sequence_number=int(payload.get("vad_next_sequence_number", 1)),
             vad_created_at=(str(payload["vad_created_at"]) if payload.get("vad_created_at") else None),
+            asr_last_completed_sequence=int(payload.get("asr_last_completed_sequence", 0)),
             model_tier=str(payload.get("model_tier", "large")),
             created_at=str(payload["created_at"]),
             updated_at=str(payload["updated_at"]),
@@ -159,9 +165,16 @@ class TaskQueueService:
             task = QueueTask.from_dict(row)
             if task.status == _TASK_RUNNING:
                 task.status = _TASK_PAUSED
+            self._rewind_asr_checkpoint_for_resume(task)
             loaded.append(task)
         self._tasks = loaded
         self._save_tasks()
+
+    def _rewind_asr_checkpoint_for_resume(self, task: QueueTask) -> None:
+        if task.stage != _STAGE_ASR:
+            return
+        if task.asr_last_completed_sequence > 0:
+            task.next_sequence_number = max(1, min(task.next_sequence_number, task.asr_last_completed_sequence))
 
     def list_tasks(self) -> list[dict[str, object]]:
         with self._lock:
@@ -238,8 +251,10 @@ class TaskQueueService:
             vad_source_dir=vad_source_dir,
             vad_total_sources=vad_total_sources,
             vad_next_source_index=1,
+            vad_next_segment_index=0,
             vad_next_sequence_number=1,
             vad_created_at=now,
+            asr_last_completed_sequence=0,
             model_tier=model_tier,
             created_at=now,
             updated_at=now,
@@ -328,6 +343,7 @@ class TaskQueueService:
                 task.next_sequence_number = 1
                 task.token_count = 0
                 task.status = _TASK_QUEUED
+                task.asr_last_completed_sequence = 0
                 if task.vad_total_audio_sec > 0:
                     task.vad_processed_audio_sec = task.vad_total_audio_sec
                 task.vad_source_dir = None
@@ -402,6 +418,8 @@ class TaskQueueService:
             for task in self._tasks:
                 if task.status == _TASK_RUNNING:
                     task.status = _TASK_PAUSED
+                    if task.stage == _STAGE_ASR:
+                        self._rewind_asr_checkpoint_for_resume(task)
                     task.updated_at = self._now_iso()
                     paused_running += 1
             self._save_tasks()
@@ -492,22 +510,41 @@ class TaskQueueService:
             if not source_path.exists():
                 raise RuntimeError(f"VAD source file is missing: {source_path}")
 
-            split_records, next_seq = self.audio_base_service.split_source_file_into_base_clips(
-                source_path,
-                base_name=task.base_name,
-                sequence_start=task.vad_next_sequence_number,
-                created_at=task.vad_created_at or task.created_at,
-                checkpoint_callback=lambda: self.checkpoint_vad(task.task_id),
-            )
+            segments = self.audio_base_service.detect_source_speech_segments(source_path)
+            if not segments:
+                with self._condition:
+                    task.vad_next_source_index = index + 1
+                    task.vad_next_segment_index = 0
+                    task.updated_at = self._now_iso()
+                    self._save_tasks()
+                continue
 
-            duration_sec = float(item.get("duration_sec", 0.0))
-            with self._condition:
-                task.vad_processed_audio_sec = min(
-                    task.vad_total_audio_sec,
-                    round(task.vad_processed_audio_sec + duration_sec, 3),
+            start_segment_index = task.vad_next_segment_index if index == task.vad_next_source_index else 0
+            for segment_index in range(start_segment_index, len(segments)):
+                self.checkpoint_vad(task.task_id)
+                start_sec, end_sec = segments[segment_index]
+                record = self.audio_base_service.export_segment_record(
+                    source_path=source_path,
+                    base_name=task.base_name,
+                    sequence_number=task.vad_next_sequence_number,
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                    created_at=task.vad_created_at or task.created_at,
                 )
+
+                with self._condition:
+                    task.vad_processed_audio_sec = min(
+                        task.vad_total_audio_sec,
+                        round(task.vad_processed_audio_sec + record.duration_sec, 3),
+                    )
+                    task.vad_next_sequence_number += 1
+                    task.vad_next_segment_index = segment_index + 1
+                    task.updated_at = self._now_iso()
+                    self._save_tasks()
+
+            with self._condition:
                 task.vad_next_source_index = index + 1
-                task.vad_next_sequence_number = max(task.vad_next_sequence_number, next_seq)
+                task.vad_next_segment_index = 0
                 task.updated_at = self._now_iso()
                 self._save_tasks()
 
@@ -548,6 +585,7 @@ class TaskQueueService:
             with self._condition:
                 task.processed_files += 1
                 task.token_count += int(result.token_count)
+                task.asr_last_completed_sequence = int(record.sequence_number)
                 task.next_sequence_number = record.sequence_number + 1
                 task.updated_at = self._now_iso()
                 self._save_tasks()

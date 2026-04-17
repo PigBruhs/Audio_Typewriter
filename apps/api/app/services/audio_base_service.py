@@ -132,6 +132,10 @@ class AudioBaseService:
             segments.append((start_sec, end_sec))
         return segments
 
+    def detect_source_speech_segments(self, source_path: Path) -> list[tuple[float, float]]:
+        normalized = self._normalize_audio_for_vad(source_path, source_path.parent)
+        return self._detect_speech_segments(normalized)
+
     def _export_segment_clip(self, source_path: Path, target_path: Path, start_sec: float, end_sec: float) -> None:
         command = [
             self.settings.ffmpeg_binary,
@@ -156,6 +160,32 @@ class AudioBaseService:
                 "ffmpeg segment export failed:\n"
                 f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             )
+
+    def export_segment_record(
+        self,
+        *,
+        source_path: Path,
+        base_name: str,
+        sequence_number: int,
+        start_sec: float,
+        end_sec: float,
+        created_at: str,
+    ) -> AudioBaseFileRecord:
+        target_dir = self.base_path(base_name)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_name = f"{sequence_number:06d}.wav"
+        target_path = target_dir / target_name
+        self._export_segment_clip(source_path, target_path, start_sec, end_sec)
+        return AudioBaseFileRecord(
+            source_audio_id=f"{base_name}:{sequence_number:06d}",
+            base_name=base_name,
+            sequence_number=sequence_number,
+            file_name=target_name,
+            file_path=str(target_path),
+            duration_sec=self._probe_duration(target_path),
+            file_size_bytes=target_path.stat().st_size,
+            created_at=created_at,
+        )
 
     def _normalize_audio_for_vad(self, source_path: Path, work_dir: Path) -> Path:
         normalized_path = work_dir / f"{source_path.stem}_vad.wav"

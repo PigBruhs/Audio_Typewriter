@@ -290,8 +290,10 @@ class PipelineTests(unittest.TestCase):
                 "vad_source_dir": null,
                 "vad_total_sources": 0,
                 "vad_next_source_index": 1,
+                "vad_next_segment_index": 0,
                 "vad_next_sequence_number": 1,
                 "vad_created_at": "2026-01-01T00:00:00+00:00",
+                "asr_last_completed_sequence": 4,
                 "model_tier": "large",
                 "created_at": "2026-01-01T00:00:00+00:00",
                 "updated_at": "2026-01-01T00:00:00+00:00",
@@ -310,7 +312,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(tasks), 1)
         self.assertEqual(tasks[0]["status"], "paused")
         self.assertEqual(tasks[0]["stage"], "asr")
-        self.assertEqual(tasks[0]["next_sequence_number"], 5)
+        self.assertEqual(tasks[0]["next_sequence_number"], 4)
 
     def test_prepare_for_shutdown_pauses_running_tasks(self) -> None:
         queue_service = TaskQueueService(self.database, ASRService(self.settings), self.index_service, self.audio_base_service, self.settings)
@@ -330,8 +332,10 @@ class PipelineTests(unittest.TestCase):
             vad_source_dir=None,
             vad_total_sources=0,
             vad_next_source_index=1,
+            vad_next_segment_index=0,
             vad_next_sequence_number=1,
             vad_created_at=now,
+            asr_last_completed_sequence=1,
             model_tier="large",
             created_at=now,
             updated_at=now,
@@ -396,8 +400,10 @@ class PipelineTests(unittest.TestCase):
             vad_source_dir=str(vad_job_dir / "sources"),
             vad_total_sources=0,
             vad_next_source_index=1,
+            vad_next_segment_index=0,
             vad_next_sequence_number=1,
             vad_created_at=now,
+            asr_last_completed_sequence=0,
             model_tier="large",
             created_at=now,
             updated_at=now,
