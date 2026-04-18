@@ -393,7 +393,7 @@ function App(): JSX.Element {
       {activeTab === "tasks" && (
         <section>
           <h2>Task Queue</h2>
-          <p>One ASR indexing task runs at a time. Pause/Resume applies to ASR stage only.</p>
+          <p>One indexing task runs at a time.</p>
           {tasks.length === 0 && <div>No tasks yet.</div>}
           {tasks.map((task) => (
             <div key={task.task_id} style={{ border: "1px solid #ccc", padding: 8, marginBottom: 8 }}>
