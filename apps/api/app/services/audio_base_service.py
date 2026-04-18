@@ -358,7 +358,7 @@ class AudioBaseService:
         vad_last_sequence = 0
         vad_lock = threading.Lock()
         vad_stop_event = threading.Event()
-        vad_progress_interval_sec = 2.0
+        vad_progress_interval_sec = 10.0
 
         def _accumulate_new_vad_duration() -> bool:
             nonlocal vad_processed_sec, vad_last_sequence

@@ -175,6 +175,8 @@ class TaskQueueService:
             return
         if task.asr_last_completed_sequence > 0:
             task.next_sequence_number = max(1, min(task.next_sequence_number, task.asr_last_completed_sequence))
+            # Keep progress counters consistent with rewind-to-last-completed strategy.
+            task.processed_files = min(task.processed_files, max(0, task.next_sequence_number - 1))
 
     def list_tasks(self) -> list[dict[str, object]]:
         with self._lock:
@@ -292,9 +294,13 @@ class TaskQueueService:
                     continue
                 if task.status in {_TASK_COMPLETED, _TASK_DISCARDED}:
                     return task.to_dict()
+                if task.status == _TASK_RUNNING:
+                    return task.to_dict()
                 if task.stage == _STAGE_VAD:
                     task.status = _TASK_RUNNING
                 else:
+                    self._rewind_asr_checkpoint_for_resume(task)
+                    self.database.purge_asr_index_from_sequence(task.base_name, task.next_sequence_number)
                     task.status = _TASK_QUEUED
                 task.last_error = None
                 task.updated_at = self._now_iso()

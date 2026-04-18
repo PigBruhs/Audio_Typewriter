@@ -253,6 +253,53 @@ class SQLiteDatabase:
         finally:
             connection.close()
 
+    def purge_asr_index_from_sequence(self, base_name: str, start_sequence_number: int) -> dict[str, int]:
+        connection = self.connect()
+        try:
+            source_row = connection.execute(
+                """
+                SELECT COUNT(1) AS c
+                FROM audio_sources
+                WHERE source_audio_id IN (
+                    SELECT source_audio_id
+                    FROM audio_base_files
+                    WHERE base_name = ? AND sequence_number >= ?
+                )
+                """,
+                (base_name, start_sequence_number),
+            ).fetchone()
+            word_row = connection.execute(
+                """
+                SELECT COUNT(1) AS c
+                FROM word_occurrences
+                WHERE source_audio_id IN (
+                    SELECT source_audio_id
+                    FROM audio_base_files
+                    WHERE base_name = ? AND sequence_number >= ?
+                )
+                """,
+                (base_name, start_sequence_number),
+            ).fetchone()
+
+            connection.execute(
+                """
+                DELETE FROM audio_sources
+                WHERE source_audio_id IN (
+                    SELECT source_audio_id
+                    FROM audio_base_files
+                    WHERE base_name = ? AND sequence_number >= ?
+                )
+                """,
+                (base_name, start_sequence_number),
+            )
+            connection.commit()
+            return {
+                "purged_sources": int(source_row["c"] if source_row else 0),
+                "purged_occurrences": int(word_row["c"] if word_row else 0),
+            }
+        finally:
+            connection.close()
+
     def replace_occurrences(self, source_audio_id: str, occurrences: Iterable[WordOccurrenceRecord]) -> int:
         occurrence_rows = list(occurrences)
         connection = self.connect()

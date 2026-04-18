@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, useEffect, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
 import {
   ApiError,
   AudioBaseItem,
@@ -67,6 +67,7 @@ function App(): JSX.Element {
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
   const [exiting, setExiting] = useState(false);
+  const previousTasksRef = useRef<Record<string, QueueTask>>({});
 
   function appendImportLog(message: string): void {
     setImportLogs((prev) => {
@@ -124,6 +125,40 @@ function App(): JSX.Element {
 
   async function refreshTasks(): Promise<void> {
     const data = await listQueueTasks();
+    const previous = previousTasksRef.current;
+    const next: Record<string, QueueTask> = {};
+
+    for (const task of data) {
+      next[task.task_id] = task;
+      const prev = previous[task.task_id];
+      if (!prev) {
+        appendImportLog(`${formatStage(task.stage)} Task detected: ${task.base_name} (${task.task_id}) status=${task.status}`);
+        continue;
+      }
+
+      if (task.status !== prev.status) {
+        appendImportLog(`[SYSTEM] ${task.base_name} status: ${prev.status} -> ${task.status}`);
+      }
+
+      if (task.last_error && task.last_error !== prev.last_error) {
+        appendImportLog(`[ERROR] ${task.base_name}: ${task.last_error}`);
+      }
+
+      if (task.stage === "asr") {
+        if (task.processed_files !== prev.processed_files || task.next_sequence_number !== prev.next_sequence_number) {
+          appendImportLog(`[ASR] ${task.base_name}: ${task.processed_files}/${task.total_files}, next=${task.next_sequence_number}`);
+        }
+      } else if (task.stage === "vad") {
+        const currentSec = task.vad_processed_audio_sec ?? 0;
+        const prevSec = prev.vad_processed_audio_sec ?? 0;
+        const totalSec = task.vad_total_audio_sec ?? 0;
+        if (Math.abs(currentSec - prevSec) >= 0.1) {
+          appendImportLog(`[VAD] ${task.base_name}: ${currentSec.toFixed(1)}s/${totalSec.toFixed(1)}s`);
+        }
+      }
+    }
+
+    previousTasksRef.current = next;
     setTasks(data);
   }
 

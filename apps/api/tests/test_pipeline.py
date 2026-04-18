@@ -452,6 +452,121 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["paused_running"], 1)
         self.assertEqual(tasks[0]["status"], "paused")
 
+    def test_resume_asr_rewinds_checkpoint_and_aligns_progress(self) -> None:
+        queue_service = TaskQueueService(self.database, ASRService(self.settings), self.index_service, self.audio_base_service, self.settings)
+        with queue_service._condition:
+            queue_service._shutdown_requested = True
+            queue_service._condition.notify_all()
+        now = "2026-01-01T00:00:00+00:00"
+        task = QueueTask(
+            task_id="task-asr-resume",
+            base_name="demo_base",
+            status="paused",
+            total_files=100,
+            processed_files=377,
+            next_sequence_number=376,
+            token_count=10,
+            stage="asr",
+            ready_for_asr=True,
+            vad_total_audio_sec=12.0,
+            vad_processed_audio_sec=12.0,
+            vad_source_dir=None,
+            vad_total_sources=0,
+            vad_next_source_index=1,
+            vad_next_segment_index=0,
+            vad_next_sequence_number=1,
+            vad_created_at=now,
+            asr_last_completed_sequence=376,
+            model_tier="large",
+            created_at=now,
+            updated_at=now,
+        )
+        with queue_service._condition:
+            queue_service._tasks = [task]
+            queue_service._save_tasks()
+
+        resumed = queue_service.resume_task("task-asr-resume")
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(resumed["next_sequence_number"], 376)
+        self.assertEqual(resumed["processed_files"], 375)
+
+    def test_resume_asr_purges_checkpoint_and_later_index_rows(self) -> None:
+        queue_service = TaskQueueService(self.database, ASRService(self.settings), self.index_service, self.audio_base_service, self.settings)
+        with queue_service._condition:
+            queue_service._shutdown_requested = True
+            queue_service._condition.notify_all()
+
+        now = "2026-01-01T00:00:00+00:00"
+        self.database.create_audio_base(
+            AudioBaseRecord(
+                base_name="demo_base",
+                base_path=str(self.settings.audio_base_dir / "demo_base"),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        self.database.replace_audio_base_files(
+            "demo_base",
+            [
+                AudioBaseFileRecord("demo_base:000001", "demo_base", 1, "000001.wav", "p1", 1.0, 1, now),
+                AudioBaseFileRecord("demo_base:000002", "demo_base", 2, "000002.wav", "p2", 1.0, 1, now),
+                AudioBaseFileRecord("demo_base:000003", "demo_base", 3, "000003.wav", "p3", 1.0, 1, now),
+            ],
+        )
+        for seq in (1, 2, 3):
+            source_id = f"demo_base:{seq:06d}"
+            self.database.upsert_audio_source(
+                AudioSourceRecord(
+                    source_audio_id=source_id,
+                    base_name="demo_base",
+                    source_path=f"audio_base/demo_base/{seq:06d}.wav",
+                    language="en",
+                    model_tier="large",
+                    device="cpu",
+                    compute_type="int8",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            self.database.replace_occurrences(
+                source_id,
+                [WordOccurrenceRecord(None, source_id, "w", "w", 0.0, 0.1, 0.9, 0, 0)],
+            )
+
+        task = QueueTask(
+            task_id="task-asr-purge",
+            base_name="demo_base",
+            status="paused",
+            total_files=3,
+            processed_files=2,
+            next_sequence_number=3,
+            token_count=2,
+            stage="asr",
+            ready_for_asr=True,
+            vad_total_audio_sec=3.0,
+            vad_processed_audio_sec=3.0,
+            vad_source_dir=None,
+            vad_total_sources=0,
+            vad_next_source_index=1,
+            vad_next_segment_index=0,
+            vad_next_sequence_number=1,
+            vad_created_at=now,
+            asr_last_completed_sequence=2,
+            model_tier="large",
+            created_at=now,
+            updated_at=now,
+        )
+        with queue_service._condition:
+            queue_service._tasks = [task]
+            queue_service._save_tasks()
+
+        resumed = queue_service.resume_task("task-asr-purge")
+        self.assertEqual(resumed["next_sequence_number"], 2)
+        self.assertEqual(resumed["processed_files"], 1)
+        self.assertIsNotNone(self.database.get_audio_source_path("demo_base:000001"))
+        self.assertIsNone(self.database.get_audio_source_path("demo_base:000002"))
+        self.assertIsNone(self.database.get_audio_source_path("demo_base:000003"))
+
     def test_delete_task_purges_temp_db_and_audio_base(self) -> None:
         queue_service = TaskQueueService(self.database, ASRService(self.settings), self.index_service, self.audio_base_service, self.settings)
         now = "2026-01-01T00:00:00+00:00"
