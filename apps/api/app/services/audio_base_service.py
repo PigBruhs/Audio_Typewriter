@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import json
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -151,9 +152,7 @@ class AudioBaseService:
             if end_sec - start_sec < 0.08:
                 continue
             segments.append((start_sec, end_sec))
-
-        min_clip_sec = max(0.0, float(getattr(self.settings, "vad_min_clip_sec", 20.0)))
-        return self._merge_segments_by_min_duration(segments, min_clip_sec)
+        return segments
 
     def _merge_segments_by_min_duration(
         self,
@@ -230,7 +229,62 @@ class AudioBaseService:
         source_duration = self._probe_duration(source_path)
         if source_duration <= 0.0:
             source_duration = self._probe_duration(normalized)
-        return self._build_split_only_segments(source_duration, speech_segments)
+        if source_duration <= 0.0:
+            return []
+
+        clipped: list[tuple[float, float]] = []
+        for start_sec, end_sec in speech_segments:
+            start_value = min(max(0.0, float(start_sec)), source_duration)
+            end_value = min(max(start_value, float(end_sec)), source_duration)
+            if end_value - start_value >= 0.08:
+                clipped.append((start_value, end_value))
+
+        if clipped:
+            return clipped
+        return [(0.0, source_duration)]
+
+    def export_vad_segments_as_clip(
+        self,
+        *,
+        base_name: str,
+        sequence_number: int,
+        segment_specs: list[tuple[Path, float, float]],
+    ) -> Path:
+        if not segment_specs:
+            raise ValueError("segment_specs must not be empty.")
+        target_dir = self.base_path(base_name)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / f"{sequence_number:06d}.wav"
+
+        with tempfile.TemporaryDirectory(prefix="audio_typewriter_vad_segments_", dir=str(self.settings.temp_dir)) as temp_dir:
+            temp_clips: list[Path] = []
+            for index, (source_path, start_sec, end_sec) in enumerate(segment_specs, start=1):
+                clip_path = Path(temp_dir) / f"{index:04d}.wav"
+                self._export_segment_clip(source_path, clip_path, start_sec, end_sec)
+                temp_clips.append(clip_path)
+            self._concat_full_clips(temp_clips, target_path)
+        return target_path
+
+    def append_vad_segments_to_existing_clip(
+        self,
+        *,
+        base_name: str,
+        sequence_number: int,
+        segment_specs: list[tuple[Path, float, float]],
+    ) -> Path:
+        if not segment_specs:
+            raise ValueError("segment_specs must not be empty.")
+        with tempfile.TemporaryDirectory(prefix="audio_typewriter_vad_tail_", dir=str(self.settings.temp_dir)) as temp_dir:
+            temp_clips: list[Path] = []
+            for index, (source_path, start_sec, end_sec) in enumerate(segment_specs, start=1):
+                clip_path = Path(temp_dir) / f"{index:04d}.wav"
+                self._export_segment_clip(source_path, clip_path, start_sec, end_sec)
+                temp_clips.append(clip_path)
+            return self.append_sources_to_existing_clip(
+                base_name=base_name,
+                sequence_number=sequence_number,
+                source_paths=temp_clips,
+            )
 
     def _export_segment_clip(self, source_path: Path, target_path: Path, start_sec: float, end_sec: float) -> None:
         command = [
@@ -256,6 +310,96 @@ class AudioBaseService:
                 "ffmpeg segment export failed:\n"
                 f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
             )
+
+    def _transcode_full_clip(self, source_path: Path, target_path: Path) -> None:
+        command = [
+            self.settings.ffmpeg_binary,
+            "-y",
+            "-i",
+            str(source_path),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-acodec",
+            "pcm_s16le",
+            str(target_path),
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "ffmpeg full clip transcode failed:\n"
+                f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            )
+
+    def _concat_full_clips(self, source_paths: list[Path], target_path: Path) -> None:
+        if not source_paths:
+            raise ValueError("No source files provided for concat export.")
+        with tempfile.TemporaryDirectory(prefix="audio_typewriter_pcm_concat_", dir=str(self.settings.temp_dir)) as temp_dir:
+            normalized_paths: list[Path] = []
+            for idx, source_path in enumerate(source_paths, start=1):
+                normalized_path = Path(temp_dir) / f"{idx:04d}.wav"
+                self._transcode_full_clip(source_path, normalized_path)
+                normalized_paths.append(normalized_path)
+
+            chunk_frames = 16000 * 10
+            output_wave: wave.Wave_write | None = None
+            try:
+                for normalized_path in normalized_paths:
+                    with wave.open(str(normalized_path), "rb") as source_wave:
+                        params = source_wave.getparams()
+                        if output_wave is None:
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            output_wave = wave.open(str(target_path), "wb")
+                            output_wave.setnchannels(params.nchannels)
+                            output_wave.setsampwidth(params.sampwidth)
+                            output_wave.setframerate(params.framerate)
+                        while True:
+                            frame_chunk = source_wave.readframes(chunk_frames)
+                            if not frame_chunk:
+                                break
+                            output_wave.writeframes(frame_chunk)
+            finally:
+                if output_wave is not None:
+                    output_wave.close()
+
+    def export_sources_as_clip(
+        self,
+        *,
+        base_name: str,
+        sequence_number: int,
+        source_paths: list[Path],
+    ) -> Path:
+        if not source_paths:
+            raise ValueError("source_paths must not be empty.")
+        target_dir = self.base_path(base_name)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / f"{sequence_number:06d}.wav"
+        if len(source_paths) == 1:
+            self._transcode_full_clip(source_paths[0], target_path)
+        else:
+            self._concat_full_clips(source_paths, target_path)
+        return target_path
+
+    def append_sources_to_existing_clip(
+        self,
+        *,
+        base_name: str,
+        sequence_number: int,
+        source_paths: list[Path],
+    ) -> Path:
+        if not source_paths:
+            raise ValueError("source_paths must not be empty.")
+        target_dir = self.base_path(base_name)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        existing_path = target_dir / f"{sequence_number:06d}.wav"
+        if not existing_path.exists():
+            raise FileNotFoundError(f"Cannot append to missing clip: {existing_path}")
+        with tempfile.TemporaryDirectory(prefix="audio_typewriter_concat_tail_", dir=str(self.settings.temp_dir)) as temp_dir:
+            merged_path = Path(temp_dir) / "merged.wav"
+            self._concat_full_clips([existing_path, *source_paths], merged_path)
+            shutil.copy2(merged_path, existing_path)
+        return existing_path
 
     def export_segment_record(
         self,
