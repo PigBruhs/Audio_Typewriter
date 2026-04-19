@@ -480,3 +480,72 @@ class SQLiteDatabase:
             return None
         return str(row["source_path"])
 
+    def get_next_word_start(self, source_audio_id: str, current_start_sec: float) -> float | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT MIN(start_sec) AS next_start
+                FROM word_occurrences
+                WHERE source_audio_id = ? AND start_sec > ?
+                """,
+                (source_audio_id, float(current_start_sec) + 1e-6),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None or row["next_start"] is None:
+            return None
+        return float(row["next_start"])
+
+    def get_base_index_summary(self, base_name: str) -> dict[str, int]:
+        connection = self.connect()
+        try:
+            source_row = connection.execute(
+                "SELECT COUNT(1) AS c FROM audio_sources WHERE base_name = ?",
+                (base_name,),
+            ).fetchone()
+            occurrence_row = connection.execute(
+                """
+                SELECT COUNT(1) AS c
+                FROM word_occurrences wo
+                JOIN audio_sources src ON src.source_audio_id = wo.source_audio_id
+                WHERE src.base_name = ?
+                """,
+                (base_name,),
+            ).fetchone()
+            token_row = connection.execute(
+                """
+                SELECT COUNT(DISTINCT wo.normalized_token) AS c
+                FROM word_occurrences wo
+                JOIN audio_sources src ON src.source_audio_id = wo.source_audio_id
+                WHERE src.base_name = ?
+                """,
+                (base_name,),
+            ).fetchone()
+        finally:
+            connection.close()
+        return {
+            "indexed_sources": int(source_row["c"] if source_row else 0),
+            "indexed_occurrences": int(occurrence_row["c"] if occurrence_row else 0),
+            "distinct_tokens": int(token_row["c"] if token_row else 0),
+        }
+
+    def list_top_words_for_base(self, base_name: str, limit: int = 50) -> list[dict[str, int | str]]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT wo.normalized_token AS token, COUNT(1) AS count
+                FROM word_occurrences wo
+                JOIN audio_sources src ON src.source_audio_id = wo.source_audio_id
+                WHERE src.base_name = ?
+                GROUP BY wo.normalized_token
+                ORDER BY count DESC, token ASC
+                LIMIT ?
+                """,
+                (base_name, int(limit)),
+            ).fetchall()
+        finally:
+            connection.close()
+        return [{"token": str(row["token"]), "count": int(row["count"])} for row in rows]
+

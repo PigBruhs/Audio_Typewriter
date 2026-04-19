@@ -26,6 +26,7 @@ class MixPlan:
 
 class MixingService:
     _MIX_MODES = {"context_priority", "all_random", "nearest_gap", "farthest_gap"}
+    _CLIP_TIMING_MODES = {"whisper_raw", "experimental_next_word_start"}
 
     def __init__(
         self,
@@ -211,11 +212,36 @@ class MixingService:
             missing_tokens=missing_tokens,
         )
 
-    def _segment_filter(self, index: int, item: MixPlanItem) -> str:
+    def _segment_filter(
+        self,
+        index: int,
+        item: MixPlanItem,
+        next_word_start_sec: float | None,
+        clip_timing_mode: str,
+    ) -> str:
+        end_sec = item.end_sec
+        if clip_timing_mode == "experimental_next_word_start" and next_word_start_sec is not None and next_word_start_sec > item.start_sec:
+            end_sec = next_word_start_sec
+        end_sec = max(item.start_sec + 0.001, end_sec)
         return (
-            f"[{index}:a]atrim=start={item.start_sec:.3f}:end={item.end_sec:.3f},"
+            f"[{index}:a]atrim=start={item.start_sec:.3f}:end={end_sec:.3f},"
             f"asetpts=PTS-STARTPTS,aresample=44100,aformat=channel_layouts=mono[a{index}]"
         )
+
+    def _gap_filter(self, index: int, gap_sec: float) -> str:
+        return f"anullsrc=r=44100:cl=mono:d={gap_sec:.3f}[g{index}]"
+
+    def _atempo_chain(self, speed_multiplier: float) -> str:
+        remaining = max(0.01, float(speed_multiplier))
+        factors: list[float] = []
+        while remaining > 2.0:
+            factors.append(2.0)
+            remaining /= 2.0
+        while remaining < 0.5:
+            factors.append(0.5)
+            remaining /= 0.5
+        factors.append(remaining)
+        return ",".join(f"atempo={factor:.6f}" for factor in factors)
 
     def _validate_manual_segment(self, item: MixPlanItem) -> None:
         if item.start_sec < 0:
@@ -228,9 +254,17 @@ class MixingService:
         plan: MixPlan,
         output_path: str | Path | None = None,
         base_name: str | None = None,
+        insert_word_gap: bool = False,
+        word_gap_ms: int | None = None,
+        speed_multiplier: float = 1.0,
+        clip_end_padding_ms: int | None = None,
+        clip_timing_mode: str = "whisper_raw",
     ) -> str:
         if not plan.items:
             raise ValueError("No mixable tokens were found.")
+
+        if clip_timing_mode not in self._CLIP_TIMING_MODES:
+            raise ValueError("clip_timing_mode must be one of: whisper_raw, experimental_next_word_start")
 
         self.settings.ensure_directories()
         target_path = Path(output_path or self.settings.mix_output_dir / f"{plan.job_id}.wav")
@@ -246,12 +280,34 @@ class MixingService:
                 raise ValueError(f"Audio source not found for id: {item.source_audio_id}")
             command.extend(["-i", source_path])
 
-        filters = [self._segment_filter(index, item) for index, item in enumerate(plan.items)]
+        filters: list[str] = []
+        for index, item in enumerate(plan.items):
+            next_word_start = None
+            if clip_timing_mode == "experimental_next_word_start":
+                next_word_start = self.database.get_next_word_start(item.source_audio_id, item.start_sec)
+            filters.append(self._segment_filter(index, item, next_word_start, clip_timing_mode))
         if len(plan.items) == 1:
-            filters.append("[a0]anull[outa]")
+            filters.append("[a0]anull[rawout]")
         else:
-            concat_inputs = "".join(f"[a{index}]" for index in range(len(plan.items)))
-            filters.append(f"{concat_inputs}concat=n={len(plan.items)}:v=0:a=1[outa]")
+            if insert_word_gap:
+                configured_gap_ms = word_gap_ms if word_gap_ms is not None else int(getattr(self.settings, "mix_word_gap_ms", 120))
+                gap_sec = max(0.0, float(configured_gap_ms) / 1000.0)
+                concat_chain: list[str] = ["[a0]"]
+                for index in range(1, len(plan.items)):
+                    filters.append(self._gap_filter(index - 1, gap_sec))
+                    concat_chain.append(f"[g{index - 1}]")
+                    concat_chain.append(f"[a{index}]")
+                concat_inputs = "".join(concat_chain)
+                filters.append(f"{concat_inputs}concat=n={len(concat_chain)}:v=0:a=1[rawout]")
+            else:
+                concat_inputs = "".join(f"[a{index}]" for index in range(len(plan.items)))
+                filters.append(f"{concat_inputs}concat=n={len(plan.items)}:v=0:a=1[rawout]")
+
+        normalized_speed = max(0.01, float(speed_multiplier))
+        if abs(normalized_speed - 1.0) > 1e-6:
+            filters.append(f"[rawout]{self._atempo_chain(normalized_speed)}[outa]")
+        else:
+            filters.append("[rawout]anull[outa]")
 
         command.extend([
             "-filter_complex",
@@ -323,6 +379,10 @@ class MixingService:
         base_name: str,
         output_path: str | Path | None = None,
         mix_mode: str = "context_priority",
+        speed_multiplier: float = 1.0,
+        gap_ms: int | None = None,
+        clip_end_padding_ms: int | None = None,
+        clip_timing_mode: str = "whisper_raw",
     ) -> MixResult:
         plan = self.build_mix_plan(sentence, base_name=base_name, mix_mode=mix_mode)
         now = datetime.now(timezone.utc).isoformat()
@@ -342,16 +402,23 @@ class MixingService:
             job_record.status = "failed"
             job_record.updated_at = datetime.now(timezone.utc).isoformat()
             self.database.create_mix_job(job_record)
-            return MixResult(
-                job_id=plan.job_id,
-                status="failed",
-                output_path=None,
-                missing_tokens=plan.missing_tokens,
-                base_name=base_name,
-                token_count=len(plan.items),
+            missing_preview = ", ".join(plan.missing_tokens[:12])
+            if len(plan.missing_tokens) > 12:
+                missing_preview = f"{missing_preview}, ..."
+            raise ValueError(
+                f"Mix aborted: missing tokens in base '{base_name}': {missing_preview}"
             )
 
-        rendered_path = self.render_plan(plan, output_path=output_path, base_name=base_name)
+        rendered_path = self.render_plan(
+            plan,
+            output_path=output_path,
+            base_name=base_name,
+            insert_word_gap=True,
+            word_gap_ms=gap_ms,
+            speed_multiplier=speed_multiplier,
+            clip_end_padding_ms=clip_end_padding_ms,
+            clip_timing_mode=clip_timing_mode,
+        )
         job_record.status = "completed"
         job_record.output_path = rendered_path
         job_record.missing_tokens = missing_json

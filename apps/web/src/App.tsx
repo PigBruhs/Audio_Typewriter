@@ -12,6 +12,7 @@ import {
   listAudioBases,
   pauseQueueTask,
   QueueTask,
+  requestReAsr,
   requestSystemExit,
   resumeQueueTask,
   requestMix,
@@ -57,6 +58,10 @@ function App(): JSX.Element {
   const [selectedBase, setSelectedBase] = useState("");
   const [selectedStats, setSelectedStats] = useState<AudioBaseItem | null>(null);
   const [mixMode, setMixMode] = useState("context_priority");
+  const [clipTimingMode, setClipTimingMode] = useState<"whisper_raw" | "experimental_next_word_start">("whisper_raw");
+  const [mixSpeed, setMixSpeed] = useState(1);
+  const [mixGapMs, setMixGapMs] = useState(100);
+  const [mixClipPaddingMs, setMixClipPaddingMs] = useState(150);
   const [sentence, setSentence] = useState("");
   const [result, setResult] = useState<string>("");
   const [importResult, setImportResult] = useState<string>("");
@@ -66,8 +71,13 @@ function App(): JSX.Element {
   const [tasks, setTasks] = useState<QueueTask[]>([]);
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [reasrLoading, setReasrLoading] = useState(false);
   const [exiting, setExiting] = useState(false);
   const previousTasksRef = useRef<Record<string, QueueTask>>({});
+  const mixSpeedError = Number.isFinite(mixSpeed) && mixSpeed > 0 ? "" : "Speed must be greater than 0.";
+  const mixGapError = Number.isFinite(mixGapMs) && mixGapMs >= 0 ? "" : "Gap must be 0 or greater.";
+  const mixClipPaddingError = Number.isFinite(mixClipPaddingMs) && mixClipPaddingMs >= 0 ? "" : "Clip end padding must be 0 or greater.";
+  const hasMixInputError = Boolean(mixSpeedError || mixGapError || mixClipPaddingError);
 
   function appendImportLog(message: string): void {
     setImportLogs((prev) => {
@@ -142,6 +152,10 @@ function App(): JSX.Element {
 
       if (task.last_error && task.last_error !== prev.last_error) {
         appendImportLog(`[ERROR] ${task.base_name}: ${task.last_error}`);
+      }
+
+      if (task.last_event && task.last_event !== prev.last_event) {
+        appendImportLog(`[SYSTEM] ${task.base_name}: ${task.last_event}`);
       }
 
       if (task.stage === "asr") {
@@ -307,6 +321,32 @@ function App(): JSX.Element {
     }
   }
 
+  async function onReAsr(): Promise<void> {
+    if (!selectedBase) {
+      setResult("Please select an audio base first.");
+      return;
+    }
+    setReasrLoading(true);
+    try {
+      const data = await requestReAsr(selectedBase);
+      appendImportLog(
+        `[SYSTEM] reASR queued for ${data.base_name}. purged_sources=${data.purged_sources}, purged_occurrences=${data.purged_occurrences}`
+      );
+      if (data.discarded_task_count > 0) {
+        appendImportLog(`[SYSTEM] reASR discarded old unfinished tasks: ${data.discarded_task_count}`);
+      }
+      await refreshTasks();
+      await loadBaseStats(selectedBase, true);
+      setResult(`reASR queued for base=${data.base_name}, task=${data.task.task_id}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "reASR failed";
+      setResult(message);
+      appendImportLog(`[ERROR] ${message}`);
+    } finally {
+      setReasrLoading(false);
+    }
+  }
+
   function onFolderSelected(event: ChangeEvent<HTMLInputElement>) {
     const files = event.target.files ? Array.from(event.target.files) : [];
     const filtered = files.filter((file) => file.name.toLowerCase().endsWith(".wav") || file.name.toLowerCase().endsWith(".mp3"));
@@ -319,13 +359,22 @@ function App(): JSX.Element {
       setResult("Please select an audio base first.");
       return;
     }
+    if (hasMixInputError) {
+      const message = [mixSpeedError, mixGapError, mixClipPaddingError].filter(Boolean).join(" ");
+      setResult(message || "Please fix mix input values.");
+      appendImportLog(`[MIX][ERROR] ${message || "Please fix mix input values."}`);
+      return;
+    }
     setLoading(true);
     setResult("");
     try {
-      const data = await requestMix(selectedBase, sentence, mixMode);
+      const data = await requestMix(selectedBase, sentence, mixMode, mixSpeed, mixGapMs, mixClipPaddingMs, clipTimingMode);
       setResult(`base=${selectedBase}, job=${data.job_id}, status=${data.status}`);
+      appendImportLog(`[MIX] base=${selectedBase}, job=${data.job_id}, status=${data.status}`);
     } catch (error) {
-      setResult(error instanceof Error ? error.message : "Unknown error");
+      const message = error instanceof Error ? error.message : "Unknown error";
+      setResult(message);
+      appendImportLog(`[MIX][ERROR] ${message}`);
     } finally {
       setLoading(false);
     }
@@ -385,14 +434,19 @@ function App(): JSX.Element {
 
       <section style={{ marginBottom: 24 }}>
         <h2>Active Audio Base</h2>
-        <select value={selectedBase} onChange={onBaseChange} style={{ width: "100%", marginBottom: 8 }}>
-          <option value="">Select a base...</option>
-          {bases.map((base) => (
-            <option key={base.base_name} value={base.base_name}>
-              {base.base_name}
-            </option>
-          ))}
-        </select>
+        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+          <select value={selectedBase} onChange={onBaseChange} style={{ flex: 1 }}>
+            <option value="">Select a base...</option>
+            {bases.map((base) => (
+              <option key={base.base_name} value={base.base_name}>
+                {base.base_name}
+              </option>
+            ))}
+          </select>
+          <button type="button" onClick={onReAsr} disabled={!selectedBase || reasrLoading}>
+            {reasrLoading ? "reASR..." : "reASR"}
+          </button>
+        </div>
         {selectedStats && (
           <div>
             <div>Audio count: {selectedStats.audio_count}</div>
@@ -410,6 +464,14 @@ function App(): JSX.Element {
           <option value="nearest_gap">Nearest Gap Priority</option>
           <option value="farthest_gap">Farthest Gap Priority</option>
         </select>
+        <select
+          value={clipTimingMode}
+          onChange={(event) => setClipTimingMode(event.target.value as "whisper_raw" | "experimental_next_word_start")}
+          style={{ width: "100%", marginBottom: 8 }}
+        >
+          <option value="whisper_raw">Timing: Whisper Raw (start -&gt; end)</option>
+          <option value="experimental_next_word_start">Timing: Experimental (start -&gt; next physical word start)</option>
+        </select>
         <textarea
           rows={4}
           value={sentence}
@@ -417,7 +479,45 @@ function App(): JSX.Element {
           style={{ width: "100%" }}
           placeholder="Type sentence here..."
         />
-        <button type="submit" disabled={loading || !selectedBase || sentence.trim().length === 0}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 8, marginBottom: 8 }}>
+          <label>
+            Speed (x)
+            <input
+              type="number"
+              min={0.1}
+              step={0.1}
+              value={mixSpeed}
+              onChange={(event) => setMixSpeed(Number(event.target.value))}
+              style={{ width: "100%" }}
+            />
+            {mixSpeedError && <div style={{ color: "crimson", fontSize: 12 }}>{mixSpeedError}</div>}
+          </label>
+          <label>
+            Gap (ms)
+            <input
+              type="number"
+              min={0}
+              step={10}
+              value={mixGapMs}
+              onChange={(event) => setMixGapMs(Number(event.target.value))}
+              style={{ width: "100%" }}
+            />
+            {mixGapError && <div style={{ color: "crimson", fontSize: 12 }}>{mixGapError}</div>}
+          </label>
+          <label>
+            End Padding (ms)
+            <input
+              type="number"
+              min={0}
+              step={10}
+              value={mixClipPaddingMs}
+              onChange={(event) => setMixClipPaddingMs(Number(event.target.value))}
+              style={{ width: "100%" }}
+            />
+            {mixClipPaddingError && <div style={{ color: "crimson", fontSize: 12 }}>{mixClipPaddingError}</div>}
+          </label>
+        </div>
+        <button type="submit" disabled={loading || !selectedBase || sentence.trim().length === 0 || hasMixInputError}>
           {loading ? "Submitting..." : "Create Mix Job"}
         </button>
       </form>
@@ -438,6 +538,7 @@ function App(): JSX.Element {
                   <div>
                     VAD Progress: {(task.vad_processed_audio_sec ?? 0).toFixed(1)}s/{(task.vad_total_audio_sec ?? 0).toFixed(1)}s
                   </div>
+                  <div>VAD Elapsed: {(task.vad_elapsed_sec ?? 0).toFixed(1)}s</div>
                   <progress
                     {...clampProgress(task.vad_processed_audio_sec ?? 0, task.vad_total_audio_sec ?? 0)}
                     style={{ width: "100%", marginTop: 4 }}
@@ -446,6 +547,7 @@ function App(): JSX.Element {
               ) : (
                 <>
                   <div>ASR Progress: {task.processed_files}/{task.total_files}, next={task.next_sequence_number}</div>
+                  <div>ASR Elapsed: {(task.asr_elapsed_sec ?? 0).toFixed(1)}s</div>
                   <progress
                     {...clampProgress(task.processed_files, task.total_files)}
                     style={{ width: "100%", marginTop: 4 }}

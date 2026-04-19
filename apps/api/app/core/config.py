@@ -25,6 +25,12 @@ class Settings:
         audio_base_dir: str | Path | None = None,
         temp_dir: str | Path | None = None,
         max_candidates_per_token: int | None = None,
+        asr_cuda_short_audio_cpu_threshold_sec: float | None = None,
+        asr_word_end_pad_sec: float | None = None,
+        asr_word_boundary_guard_sec: float | None = None,
+        vad_min_clip_sec: float | None = None,
+        mix_word_gap_ms: int | None = None,
+        mix_clip_end_padding_ms: int | None = None,
     ) -> None:
         self.app_name = app_name or os.getenv("AT_APP_NAME", "Audio Typewriter API")
         self.app_env = app_env or os.getenv("AT_APP_ENV", "dev")
@@ -46,6 +52,24 @@ class Settings:
         self.temp_dir = Path(temp_dir or os.getenv("AT_TEMP_DIR", "./temp"))
         self.max_candidates_per_token = int(
             max_candidates_per_token or os.getenv("AT_MAX_CANDIDATES_PER_TOKEN", "8")
+        )
+        self.asr_cuda_short_audio_cpu_threshold_sec = float(
+            asr_cuda_short_audio_cpu_threshold_sec
+            if asr_cuda_short_audio_cpu_threshold_sec is not None
+            else os.getenv("AT_ASR_SHORT_AUDIO_CPU_THRESHOLD_SEC", "0.8")
+        )
+        self.asr_word_end_pad_sec = float(
+            asr_word_end_pad_sec if asr_word_end_pad_sec is not None else os.getenv("AT_ASR_WORD_END_PAD_SEC", "0.04")
+        )
+        self.asr_word_boundary_guard_sec = float(
+            asr_word_boundary_guard_sec
+            if asr_word_boundary_guard_sec is not None
+            else os.getenv("AT_ASR_WORD_BOUNDARY_GUARD_SEC", "0.01")
+        )
+        self.vad_min_clip_sec = float(vad_min_clip_sec if vad_min_clip_sec is not None else os.getenv("AT_VAD_MIN_CLIP_SEC", "20"))
+        self.mix_word_gap_ms = int(mix_word_gap_ms if mix_word_gap_ms is not None else os.getenv("AT_MIX_WORD_GAP_MS", "120"))
+        self.mix_clip_end_padding_ms = int(
+            mix_clip_end_padding_ms if mix_clip_end_padding_ms is not None else os.getenv("AT_MIX_CLIP_END_PADDING_MS", "150")
         )
 
     @property

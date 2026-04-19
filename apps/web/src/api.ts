@@ -60,10 +60,21 @@ export type QueueTask = {
   model_tier: string;
   created_at: string;
   updated_at: string;
+  vad_elapsed_sec?: number;
+  asr_elapsed_sec?: number;
   last_error?: string | null;
+  last_event?: string | null;
   overwritten?: boolean;
   cleared_audio_files?: number;
   cleared_index_sources?: number;
+};
+
+export type ReAsrResponse = {
+  base_name: string;
+  task: QueueTask;
+  purged_sources: number;
+  purged_occurrences: number;
+  discarded_task_count: number;
 };
 
 export type ImportStreamEvent =
@@ -99,13 +110,29 @@ async function readErrorDetail(response: Response): Promise<string> {
   return `HTTP ${response.status}`;
 }
 
-export async function requestMix(baseName: string, sentence: string, mixMode: string): Promise<MixResponse> {
+export async function requestMix(
+  baseName: string,
+  sentence: string,
+  mixMode: string,
+  speedMultiplier: number,
+  gapMs: number,
+  clipEndPaddingMs: number,
+  clipTimingMode: "whisper_raw" | "experimental_next_word_start"
+): Promise<MixResponse> {
   const response = await fetch("/api/v1/mix", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ base_name: baseName, sentence, mix_mode: mixMode }),
+    body: JSON.stringify({
+      base_name: baseName,
+      sentence,
+      mix_mode: mixMode,
+      speed_multiplier: speedMultiplier,
+      gap_ms: gapMs,
+      clip_end_padding_ms: clipEndPaddingMs,
+      clip_timing_mode: clipTimingMode,
+    }),
   });
 
   if (!response.ok) {
@@ -151,6 +178,16 @@ export async function getAudioBaseStats(baseName: string): Promise<AudioBaseItem
     throw new ApiError(`Get base stats failed: ${await readErrorDetail(response)}`, response.status);
   }
   return (await response.json()) as AudioBaseItem;
+}
+
+export async function requestReAsr(baseName: string): Promise<ReAsrResponse> {
+  const response = await fetch(`/api/v1/audio-bases/${encodeURIComponent(baseName)}/reasr`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(`reASR failed: ${await readErrorDetail(response)}`);
+  }
+  return (await response.json()) as ReAsrResponse;
 }
 
 export async function importAudioBase(baseName: string, files: File[]): Promise<AudioBaseImportResponse> {

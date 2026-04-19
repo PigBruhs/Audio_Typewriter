@@ -11,7 +11,7 @@ from pathlib import Path
 from ..core.config import Settings, settings
 from ..db import SQLiteDatabase
 from ..models import AudioBaseRecord
-from .asr_service import ASRService
+from .asr_service import ASRService, ASRTranscriptionError
 from .audio_base_service import AudioBaseService
 from .index_service import IndexService
 
@@ -54,6 +54,11 @@ class QueueTask:
     cleared_audio_files: int = 0
     cleared_index_sources: int = 0
     cancel_requested: bool = False
+    last_event: str | None = None
+    vad_elapsed_sec: float = 0.0
+    asr_elapsed_sec: float = 0.0
+    vad_running_since: str | None = None
+    asr_running_since: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -82,6 +87,11 @@ class QueueTask:
             "overwritten": self.overwritten,
             "cleared_audio_files": self.cleared_audio_files,
             "cleared_index_sources": self.cleared_index_sources,
+            "last_event": self.last_event,
+            "vad_elapsed_sec": self.vad_elapsed_sec,
+            "asr_elapsed_sec": self.asr_elapsed_sec,
+            "vad_running_since": self.vad_running_since,
+            "asr_running_since": self.asr_running_since,
         }
 
     @staticmethod
@@ -113,6 +123,11 @@ class QueueTask:
             cleared_audio_files=int(payload.get("cleared_audio_files", 0)),
             cleared_index_sources=int(payload.get("cleared_index_sources", 0)),
             cancel_requested=False,
+            last_event=(str(payload["last_event"]) if payload.get("last_event") is not None else None),
+            vad_elapsed_sec=float(payload.get("vad_elapsed_sec", 0.0)),
+            asr_elapsed_sec=float(payload.get("asr_elapsed_sec", 0.0)),
+            vad_running_since=(str(payload["vad_running_since"]) if payload.get("vad_running_since") else None),
+            asr_running_since=(str(payload["asr_running_since"]) if payload.get("asr_running_since") else None),
         )
 
 
@@ -165,10 +180,56 @@ class TaskQueueService:
             task = QueueTask.from_dict(row)
             if task.status == _TASK_RUNNING:
                 task.status = _TASK_PAUSED
+                task.vad_running_since = None
+                task.asr_running_since = None
             self._rewind_asr_checkpoint_for_resume(task)
             loaded.append(task)
         self._tasks = loaded
         self._save_tasks()
+
+    def _parse_iso_datetime(self, value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    def _start_stage_timer(self, task: QueueTask, stage: str, now_iso: str | None = None) -> None:
+        stamp = now_iso or self._now_iso()
+        if stage == _STAGE_VAD:
+            if not task.vad_running_since:
+                task.vad_running_since = stamp
+            task.asr_running_since = None
+            return
+        if stage == _STAGE_ASR:
+            if not task.asr_running_since:
+                task.asr_running_since = stamp
+            task.vad_running_since = None
+
+    def _accumulate_stage_timer(self, task: QueueTask, stage: str, now_iso: str | None = None) -> float:
+        stamp = now_iso or self._now_iso()
+        now_dt = self._parse_iso_datetime(stamp)
+        if now_dt is None:
+            return 0.0
+
+        if stage == _STAGE_VAD:
+            since_dt = self._parse_iso_datetime(task.vad_running_since)
+            task.vad_running_since = None
+            if since_dt is None:
+                return task.vad_elapsed_sec
+            task.vad_elapsed_sec = round(max(0.0, task.vad_elapsed_sec + max(0.0, (now_dt - since_dt).total_seconds())), 3)
+            return task.vad_elapsed_sec
+
+        since_dt = self._parse_iso_datetime(task.asr_running_since)
+        task.asr_running_since = None
+        if since_dt is None:
+            return task.asr_elapsed_sec
+        task.asr_elapsed_sec = round(max(0.0, task.asr_elapsed_sec + max(0.0, (now_dt - since_dt).total_seconds())), 3)
+        return task.asr_elapsed_sec
 
     def _rewind_asr_checkpoint_for_resume(self, task: QueueTask) -> None:
         if task.stage != _STAGE_ASR:
@@ -263,6 +324,53 @@ class TaskQueueService:
             overwritten=overwritten,
             cleared_audio_files=cleared_audio_files,
             cleared_index_sources=cleared_index_sources,
+            vad_elapsed_sec=0.0,
+            asr_elapsed_sec=0.0,
+            vad_running_since=now,
+            asr_running_since=None,
+        )
+        with self._condition:
+            self._tasks.append(task)
+            self._save_tasks()
+            self._condition.notify_all()
+        return task.to_dict()
+
+    def enqueue_reasr_task(
+        self,
+        *,
+        base_name: str,
+        total_files: int,
+        model_tier: str = "large",
+        task_id: str | None = None,
+    ) -> dict[str, object]:
+        now = self._now_iso()
+        task = QueueTask(
+            task_id=str(task_id or uuid.uuid4()),
+            base_name=base_name,
+            status=_TASK_QUEUED,
+            total_files=max(0, int(total_files)),
+            processed_files=0,
+            next_sequence_number=1,
+            token_count=0,
+            stage=_STAGE_ASR,
+            ready_for_asr=True,
+            vad_total_audio_sec=0.0,
+            vad_processed_audio_sec=0.0,
+            vad_source_dir=None,
+            vad_total_sources=0,
+            vad_next_source_index=1,
+            vad_next_segment_index=0,
+            vad_next_sequence_number=1,
+            vad_created_at=None,
+            asr_last_completed_sequence=0,
+            model_tier=model_tier,
+            created_at=now,
+            updated_at=now,
+            last_event=f"reASR queued for base '{base_name}' ({total_files} files).",
+            vad_elapsed_sec=0.0,
+            asr_elapsed_sec=0.0,
+            vad_running_since=None,
+            asr_running_since=None,
         )
         with self._condition:
             self._tasks.append(task)
@@ -280,6 +388,7 @@ class TaskQueueService:
                 if task.status == _TASK_QUEUED:
                     task.status = _TASK_PAUSED
                 elif task.status == _TASK_RUNNING:
+                    self._accumulate_stage_timer(task, task.stage)
                     task.status = _TASK_PAUSED
                 task.updated_at = self._now_iso()
                 self._save_tasks()
@@ -298,11 +407,14 @@ class TaskQueueService:
                     return task.to_dict()
                 if task.stage == _STAGE_VAD:
                     task.status = _TASK_RUNNING
+                    self._start_stage_timer(task, _STAGE_VAD)
                 else:
                     self._rewind_asr_checkpoint_for_resume(task)
                     self.database.purge_asr_index_from_sequence(task.base_name, task.next_sequence_number)
                     task.status = _TASK_QUEUED
+                    task.asr_running_since = None
                 task.last_error = None
+                task.last_event = None
                 task.updated_at = self._now_iso()
                 self._save_tasks()
                 self._condition.notify_all()
@@ -350,8 +462,12 @@ class TaskQueueService:
                 task.token_count = 0
                 task.status = _TASK_QUEUED
                 task.asr_last_completed_sequence = 0
+                self._accumulate_stage_timer(task, _STAGE_VAD)
+                task.asr_elapsed_sec = 0.0
+                task.asr_running_since = None
                 if task.vad_total_audio_sec > 0:
                     task.vad_processed_audio_sec = task.vad_total_audio_sec
+                task.last_event = f"VAD total elapsed: {task.vad_elapsed_sec:.1f}s"
                 task.vad_source_dir = None
                 task.updated_at = self._now_iso()
                 self._save_tasks()
@@ -423,6 +539,7 @@ class TaskQueueService:
             paused_running = 0
             for task in self._tasks:
                 if task.status == _TASK_RUNNING:
+                    self._accumulate_stage_timer(task, task.stage)
                     task.status = _TASK_PAUSED
                     if task.stage == _STAGE_ASR:
                         self._rewind_asr_checkpoint_for_resume(task)
@@ -468,6 +585,7 @@ class TaskQueueService:
                     continue
                 if task.status != _TASK_RUNNING:
                     task.status = _TASK_RUNNING
+                    self._start_stage_timer(task, task.stage)
                 task.updated_at = self._now_iso()
                 self._save_tasks()
 
@@ -478,6 +596,7 @@ class TaskQueueService:
                     self._run_task(task)
             except Exception as exc:  # pragma: no cover - safety net
                 with self._condition:
+                    self._accumulate_stage_timer(task, task.stage)
                     task.status = _TASK_FAILED
                     task.last_error = str(exc)
                     task.updated_at = self._now_iso()
@@ -502,11 +621,13 @@ class TaskQueueService:
 
             with self._condition:
                 if task.cancel_requested:
+                    self._accumulate_stage_timer(task, _STAGE_VAD)
                     task.status = _TASK_DISCARDED
                     task.updated_at = self._now_iso()
                     self._save_tasks()
                     return
                 if task.status == _TASK_PAUSED:
+                    self._accumulate_stage_timer(task, _STAGE_VAD)
                     task.updated_at = self._now_iso()
                     self._save_tasks()
                     return
@@ -563,6 +684,19 @@ class TaskQueueService:
         )
         self.database.create_audio_base(base_record)
         self.database.replace_audio_base_files(task.base_name, records)
+        metadata_path = self.audio_base_service.update_base_metadata(
+            task.base_name,
+            {
+                "base_path": str(self.audio_base_service.base_path(task.base_name)),
+                "audio_count": len(records),
+                "vad_total_elapsed_sec": round(task.vad_elapsed_sec, 3),
+                "vad_completed_at": self._now_iso(),
+            },
+        )
+        with self._condition:
+            task.last_event = f"VAD total elapsed: {task.vad_elapsed_sec:.1f}s (saved {metadata_path.name})"
+            task.updated_at = self._now_iso()
+            self._save_tasks()
         self.activate_asr_stage(task.task_id, total_files=len(records))
 
     def _run_task(self, task: QueueTask) -> None:
@@ -570,22 +704,43 @@ class TaskQueueService:
         for record in file_records:
             with self._condition:
                 if task.cancel_requested:
+                    self._accumulate_stage_timer(task, _STAGE_ASR)
                     task.status = _TASK_DISCARDED
                     task.updated_at = self._now_iso()
                     self._save_tasks()
                     return
                 if task.status == _TASK_PAUSED:
+                    self._accumulate_stage_timer(task, _STAGE_ASR)
                     task.updated_at = self._now_iso()
                     self._save_tasks()
                     return
 
-            source_record, occurrences, result = self.asr_service.ingest(
-                source_path=record.file_path,
-                source_audio_id=record.source_audio_id,
-                base_name=record.base_name,
-                language="en",
-                model_tier=task.model_tier,
-            )
+            try:
+                source_record, occurrences, result = self.asr_service.ingest(
+                    source_path=record.file_path,
+                    source_audio_id=record.source_audio_id,
+                    base_name=record.base_name,
+                    language="en",
+                    model_tier=task.model_tier,
+                )
+            except ASRTranscriptionError as exc:
+                with self._condition:
+                    self._accumulate_stage_timer(task, _STAGE_ASR)
+                    task.status = _TASK_PAUSED
+                    task.last_error = (
+                        f"ASR paused at seq={record.sequence_number} ({record.source_audio_id}): {exc}"
+                    )
+                    task.last_event = exc.runtime_events[-1] if exc.runtime_events else "ASR failed and task was paused."
+                    task.updated_at = self._now_iso()
+                    self._save_tasks()
+                return
+
+            runtime_events = self.asr_service.consume_runtime_events()
+            if runtime_events:
+                with self._condition:
+                    task.last_event = runtime_events[-1]
+                    task.updated_at = self._now_iso()
+                    self._save_tasks()
             self.index_service.ingest(source_record, occurrences)
 
             with self._condition:
@@ -598,7 +753,22 @@ class TaskQueueService:
 
         with self._condition:
             if task.status == _TASK_RUNNING:
+                self._accumulate_stage_timer(task, _STAGE_ASR)
                 task.status = _TASK_COMPLETED
+                index_summary = self.database.get_base_index_summary(task.base_name)
+                top_words = self.database.list_top_words_for_base(task.base_name, limit=50)
+                metadata_path = self.audio_base_service.update_base_metadata(
+                    task.base_name,
+                    {
+                        "asr_total_elapsed_sec": round(task.asr_elapsed_sec, 3),
+                        "asr_completed_at": self._now_iso(),
+                        "indexed_sources": index_summary["indexed_sources"],
+                        "indexed_occurrences": index_summary["indexed_occurrences"],
+                        "distinct_tokens": index_summary["distinct_tokens"],
+                        "top_words": top_words,
+                    },
+                )
+                task.last_event = f"ASR total elapsed: {task.asr_elapsed_sec:.1f}s (saved {metadata_path.name})"
                 task.updated_at = self._now_iso()
                 self._save_tasks()
 

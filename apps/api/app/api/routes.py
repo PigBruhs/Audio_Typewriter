@@ -298,6 +298,32 @@ def get_audio_base_stats(base_name: str) -> AudioBaseStatsResponse:
     )
 
 
+@router.post("/audio-bases/{base_name}/reasr")
+def trigger_reasr(base_name: str) -> dict[str, object]:
+    normalized_base_name = _audio_base_service.validate_base_name(base_name)
+    stats = _database.get_audio_base_stats(normalized_base_name)
+    if not stats:
+        raise HTTPException(status_code=404, detail=f"Audio base '{normalized_base_name}' was not found")
+
+    file_records = _database.list_audio_base_files(normalized_base_name)
+    if not file_records:
+        raise HTTPException(status_code=400, detail=f"Audio base '{normalized_base_name}' has no files for reASR")
+
+    discarded = _task_queue_service.discard_unfinished_for_base(normalized_base_name)
+    purge_info = _database.purge_asr_index_from_sequence(normalized_base_name, 1)
+    queued_task = _task_queue_service.enqueue_reasr_task(
+        base_name=normalized_base_name,
+        total_files=len(file_records),
+    )
+    return {
+        "base_name": normalized_base_name,
+        "task": queued_task,
+        "purged_sources": int(purge_info.get("purged_sources", 0)),
+        "purged_occurrences": int(purge_info.get("purged_occurrences", 0)),
+        "discarded_task_count": int(discarded.get("discarded_tasks", 0)),
+    }
+
+
 @router.post("/models/download", response_model=ModelDownloadResponse)
 def download_model(payload: ModelDownloadRequest) -> ModelDownloadResponse:
     try:
@@ -353,6 +379,10 @@ def create_mix(payload: MixRequest) -> MixResponse:
             base_name=payload.base_name,
             output_path=payload.output_path,
             mix_mode=payload.mix_mode,
+            speed_multiplier=payload.speed_multiplier,
+            gap_ms=payload.gap_ms,
+            clip_end_padding_ms=payload.clip_end_padding_ms,
+            clip_timing_mode=payload.clip_timing_mode,
         )
         return MixResponse(
             job_id=result.job_id,
