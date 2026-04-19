@@ -6,7 +6,7 @@ import {
   getAudioBaseStats,
   getHealth,
   HealthResponse,
-  importAudioBaseStream,
+  importAudioBaseByPathStream,
   ImportStreamEvent,
   listQueueTasks,
   listAudioBases,
@@ -52,7 +52,7 @@ function clampProgress(current: number, total: number): { value: number; max: nu
 function App(): JSX.Element {
   const [activeTab, setActiveTab] = useState<"workbench" | "tasks">("workbench");
   const [baseName, setBaseName] = useState("");
-  const [baseFiles, setBaseFiles] = useState<File[]>([]);
+  const [sourceFolderPath, setSourceFolderPath] = useState("");
   const [bases, setBases] = useState<AudioBaseItem[]>([]);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [selectedBase, setSelectedBase] = useState("");
@@ -178,8 +178,8 @@ function App(): JSX.Element {
 
   async function onImportSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!baseName.trim() || baseFiles.length === 0) {
-      setImportResult("Please enter base name and select a folder.");
+    if (!baseName.trim() || !sourceFolderPath.trim()) {
+      setImportResult("Please enter base name and local folder path.");
       return;
     }
 
@@ -238,7 +238,7 @@ function App(): JSX.Element {
         }
       };
 
-      const data = await importAudioBaseStream(baseName.trim(), baseFiles, onStreamEvent);
+      const data = await importAudioBaseByPathStream(baseName.trim(), sourceFolderPath.trim(), onStreamEvent);
       const overwriteLabel = data.overwritten
         ? `overwrite=yes(cleared files=${data.cleared_audio_files}, cleared indexed sources=${data.cleared_index_sources})`
         : "overwrite=no";
@@ -347,12 +347,6 @@ function App(): JSX.Element {
     }
   }
 
-  function onFolderSelected(event: ChangeEvent<HTMLInputElement>) {
-    const files = event.target.files ? Array.from(event.target.files) : [];
-    const filtered = files.filter((file) => file.name.toLowerCase().endsWith(".wav") || file.name.toLowerCase().endsWith(".mp3"));
-    setBaseFiles(filtered);
-  }
-
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedBase) {
@@ -409,15 +403,13 @@ function App(): JSX.Element {
             style={{ width: "100%", marginBottom: 8 }}
           />
           <input
-            type="file"
-            multiple
-            accept=".wav,.mp3,audio/wav,audio/mpeg"
-            onChange={onFolderSelected}
+            value={sourceFolderPath}
+            onChange={(event) => setSourceFolderPath(event.target.value)}
+            placeholder="local folder path, e.g. E:\\Recordings\\Henry"
             style={{ width: "100%", marginBottom: 8 }}
-            {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
           />
-          <div style={{ marginBottom: 8 }}>Selected files: {baseFiles.length}</div>
-          <button type="submit" disabled={importing || !baseName.trim() || baseFiles.length === 0}>
+          <div style={{ marginBottom: 8 }}>Backend will scan .wav/.mp3 from this local folder path.</div>
+          <button type="submit" disabled={importing || !baseName.trim() || !sourceFolderPath.trim()}>
             {importing ? "Importing and indexing..." : "Import Base"}
           </button>
         </form>

@@ -51,6 +51,15 @@ Audio_Typewriter/
 
 ## Quick Start (Windows PowerShell)
 
+0) One-click start (API + Web):
+
+```powershell
+Set-Location "E:\Audio_Typewriter"
+.\start.ps1
+```
+
+The launcher internally sets `PYTHONPATH` for `apps/api` + `packages/core`, so `audio_typewriter_core` imports work out of the box.
+
 1) Bootstrap environment:
 
 ```powershell
@@ -103,8 +112,14 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/models/download" -Method PO
    - Trigger model download/warmup into `./models`.
 2. `POST /api/v1/audio-bases/import`
    - Multipart form: `base_name` + folder audio files (`.wav`, `.mp3`).
+    - Default multipart limit is `AT_MULTIPART_MAX_FILES=20000` (for large batches like 5525 files).
    - Existing base with same name is explicitly overwritten: old DB index rows + base files are cleared first.
    - Files are segmented by Silero VAD and stored as `./audio_base/<base_name>/000001.wav...`, then ingested/indexed.
+2b. `POST /api/v1/audio-bases/import/local` (recommended for this local-only project)
+    - JSON: `{"base_name":"Henry","folder_path":"E:\\your\\local\\folder"}`.
+    - Frontend now sends only the local folder path; backend scans local `.wav/.mp3` directly.
+2c. `POST /api/v1/audio-bases/import/local/stream`
+    - Streaming variant used by Web UI for immediate queue/progress events.
 3. `GET /api/v1/audio-bases`
    - List available bases with `audio_count`, `total_duration_sec`, `total_file_size_bytes`.
 4. `GET /api/v1/audio-bases/{base_name}/stats`

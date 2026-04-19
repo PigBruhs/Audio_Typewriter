@@ -338,6 +338,36 @@ class AudioBaseService:
         (job_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return str(source_dir), manifest, round(total_audio_sec, 3)
 
+    def stage_vad_sources_from_folder_path(self, task_id: str, folder_path: str) -> tuple[str, list[dict[str, object]], float]:
+        root_dir = Path(folder_path).expanduser()
+        if not root_dir.exists() or not root_dir.is_dir():
+            raise ValueError(f"Folder was not found or is not a directory: {folder_path}")
+
+        all_files = [path for path in root_dir.rglob("*") if path.is_file() and path.suffix.lower() in _ALLOWED_EXTENSIONS]
+        if not all_files:
+            raise ValueError("No .wav or .mp3 files were found in the selected folder.")
+
+        all_files.sort(key=lambda item: item.relative_to(root_dir).as_posix().lower())
+        job_dir = self.vad_job_dir(task_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest: list[dict[str, object]] = []
+        total_audio_sec = 0.0
+        for index, source_path in enumerate(all_files, start=1):
+            relative_name = source_path.relative_to(root_dir).as_posix()
+            duration_sec = self._probe_duration(source_path)
+            total_audio_sec += duration_sec
+            manifest.append(
+                {
+                    "index": index,
+                    "file_name": relative_name,
+                    "duration_sec": duration_sec,
+                }
+            )
+
+        (job_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(root_dir), manifest, round(total_audio_sec, 3)
+
     def load_vad_manifest(self, task_id: str) -> list[dict[str, object]]:
         manifest_path = self.vad_job_dir(task_id) / "manifest.json"
         if not manifest_path.exists():

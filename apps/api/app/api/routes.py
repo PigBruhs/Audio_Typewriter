@@ -6,9 +6,9 @@ import threading
 import time
 import uuid
 from queue import Empty, Queue
-from typing import Callable
+from typing import Callable, cast
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 try:
@@ -21,6 +21,7 @@ from ..models import MixPlanItem
 from ..schemas import (
     HealthResponse,
     AudioBaseImportResponse,
+    LocalAudioBaseImportRequest,
     AudioBaseListItem,
     AudioBaseStatsResponse,
     IngestRequest,
@@ -162,6 +163,115 @@ def _run_audio_base_import(
     return response
 
 
+def _run_audio_base_import_from_folder(
+    *,
+    base_name: str,
+    folder_path: str,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
+) -> AudioBaseImportResponse:
+    normalized_base_name = _audio_base_service.validate_base_name(base_name)
+    overwritten = _audio_base_service.base_exists(normalized_base_name)
+    cleared_audio_files = 0
+    cleared_index_sources = 0
+    discarded_info = {"discarded_tasks": 0, "had_running_task": 0}
+    if overwritten:
+        discarded_info = _task_queue_service.discard_unfinished_for_base(normalized_base_name)
+        cleanup_info = _database.clear_audio_base_for_overwrite(normalized_base_name)
+        cleared_index_sources = int(cleanup_info["cleared_index_sources"])
+        cleared_audio_files = _audio_base_service.clear_base_storage(normalized_base_name)
+        if progress_callback:
+            progress_callback(
+                {
+                    "type": "overwrite",
+                    "base_name": normalized_base_name,
+                    "cleared_audio_files": cleared_audio_files,
+                    "cleared_index_sources": cleared_index_sources,
+                }
+            )
+
+    task_id = str(uuid.uuid4())
+    source_dir, manifest, total_audio_sec = _audio_base_service.stage_vad_sources_from_folder_path(task_id, folder_path)
+    queued_task = _task_queue_service.enqueue_import_task(
+        base_name=normalized_base_name,
+        total_files=0,
+        vad_source_dir=source_dir,
+        vad_total_sources=len(manifest),
+        vad_total_audio_sec=total_audio_sec,
+        model_tier="large",
+        overwritten=overwritten,
+        cleared_audio_files=cleared_audio_files,
+        cleared_index_sources=cleared_index_sources,
+        task_id=task_id,
+    )
+
+    stats = _database.get_audio_base_stats(normalized_base_name) or _audio_base_service.summarize_records(
+        normalized_base_name,
+        [],
+    )
+    response = AudioBaseImportResponse(
+        base_name=normalized_base_name,
+        overwritten=overwritten,
+        cleared_audio_files=cleared_audio_files,
+        cleared_index_sources=cleared_index_sources,
+        audio_count=int(stats.audio_count if hasattr(stats, "audio_count") else 0),
+        total_duration_sec=float(stats.total_duration_sec if hasattr(stats, "total_duration_sec") else 0.0),
+        total_file_size_bytes=int(stats.total_file_size_bytes if hasattr(stats, "total_file_size_bytes") else 0),
+        ingested_source_count=0,
+        token_count=0,
+        task_id=str(queued_task["task_id"]),
+        task_status=str(queued_task["status"]),
+        discarded_task_count=int(discarded_info["discarded_tasks"]),
+    )
+
+    if progress_callback:
+        progress_callback({"type": "task", "task": queued_task})
+        progress_callback(
+            {
+                "type": "vad_start",
+                "base_name": normalized_base_name,
+                "total_audio_sec": total_audio_sec,
+                "processed_audio_sec": 0.0,
+            }
+        )
+        progress_callback(
+            {
+                "type": "status",
+                "message": "Local-folder import task queued. VAD/ASR will run in background; pause/resume in Tasks tab.",
+            }
+        )
+        progress_callback({"type": "start", "base_name": normalized_base_name, "total": len(manifest)})
+        progress_callback({"type": "complete", "result": response.model_dump()})
+    return response
+
+
+async def _parse_import_form(request: Request) -> tuple[str, list[UploadFile]]:
+    try:
+        form = await request.form(
+            max_files=max(1, int(_audio_base_service.settings.multipart_max_files)),
+            max_fields=max(2, int(_audio_base_service.settings.multipart_max_fields)),
+        )
+    except Exception as exc:
+        detail = str(exc) or "invalid multipart form"
+        if "Too many files" in detail:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Import failed: too many files for one request. "
+                    f"Current limit is {_audio_base_service.settings.multipart_max_files}."
+                ),
+            ) from exc
+        raise HTTPException(status_code=400, detail=f"Import failed: {detail}") from exc
+
+    base_name = str(form.get("base_name") or "").strip()
+    if not base_name:
+        raise HTTPException(status_code=400, detail="Import failed: missing form field 'base_name'.")
+
+    files = [item for item in form.getlist("files") if hasattr(item, "filename") and hasattr(item, "file")]
+    if not files:
+        raise HTTPException(status_code=400, detail="Import failed: no valid .wav/.mp3 upload files were provided.")
+    return base_name, cast(list[UploadFile], files)
+
+
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     resolved_device, compute_type = _asr_service.resolve_runtime()
@@ -176,7 +286,8 @@ def health() -> HealthResponse:
 
 
 @router.post("/audio-bases/import", response_model=AudioBaseImportResponse)
-def import_audio_base(base_name: str = Form(...), files: list[UploadFile] = File(...)) -> AudioBaseImportResponse:
+async def import_audio_base(request: Request) -> AudioBaseImportResponse:
+    base_name, files = await _parse_import_form(request)
     try:
         return _run_audio_base_import(base_name=base_name, files=files)
     except ValueError as exc:
@@ -185,8 +296,20 @@ def import_audio_base(base_name: str = Form(...), files: list[UploadFile] = File
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.post("/audio-bases/import/local", response_model=AudioBaseImportResponse)
+def import_audio_base_local(payload: LocalAudioBaseImportRequest) -> AudioBaseImportResponse:
+    try:
+        return _run_audio_base_import_from_folder(base_name=payload.base_name, folder_path=payload.folder_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.post("/audio-bases/import/stream")
-def import_audio_base_stream(base_name: str = Form(...), files: list[UploadFile] = File(...)) -> StreamingResponse:
+async def import_audio_base_stream(request: Request) -> StreamingResponse:
+    base_name, files = await _parse_import_form(request)
+
     def _iter_events():
         event_queue: Queue[dict[str, object]] = Queue()
 
@@ -213,6 +336,42 @@ def import_audio_base_stream(base_name: str = Form(...), files: list[UploadFile]
                 payload = event_queue.get(timeout=0.2)
                 yield json.dumps(payload, ensure_ascii=False) + "\n"
                 if payload.get("type") in {"complete", "error"} and not worker.is_alive():
+                    break
+            except Empty:
+                if not worker.is_alive() and event_queue.empty():
+                    break
+
+    return StreamingResponse(_iter_events(), media_type="application/x-ndjson")
+
+
+@router.post("/audio-bases/import/local/stream")
+def import_audio_base_local_stream(payload: LocalAudioBaseImportRequest) -> StreamingResponse:
+    def _iter_events():
+        event_queue: Queue[dict[str, object]] = Queue()
+
+        def _emit(event_payload: dict[str, object]) -> None:
+            event_queue.put(event_payload)
+
+        def _worker() -> None:
+            try:
+                _run_audio_base_import_from_folder(
+                    base_name=payload.base_name,
+                    folder_path=payload.folder_path,
+                    progress_callback=_emit,
+                )
+            except ValueError as exc:
+                _emit({"type": "error", "detail": str(exc)})
+            except RuntimeError as exc:
+                _emit({"type": "error", "detail": str(exc)})
+
+        worker = threading.Thread(target=_worker, daemon=True, name="import-local-stream-worker")
+        worker.start()
+
+        while True:
+            try:
+                event_payload = event_queue.get(timeout=0.2)
+                yield json.dumps(event_payload, ensure_ascii=False) + "\n"
+                if event_payload.get("type") in {"complete", "error"} and not worker.is_alive():
                     break
             except Empty:
                 if not worker.is_alive() and event_queue.empty():

@@ -31,6 +31,8 @@ class Settings:
         vad_min_clip_sec: float | None = None,
         mix_word_gap_ms: int | None = None,
         mix_clip_end_padding_ms: int | None = None,
+        multipart_max_files: int | None = None,
+        multipart_max_fields: int | None = None,
     ) -> None:
         self.app_name = app_name or os.getenv("AT_APP_NAME", "Audio Typewriter API")
         self.app_env = app_env or os.getenv("AT_APP_ENV", "dev")
@@ -70,6 +72,12 @@ class Settings:
         self.mix_word_gap_ms = int(mix_word_gap_ms if mix_word_gap_ms is not None else os.getenv("AT_MIX_WORD_GAP_MS", "120"))
         self.mix_clip_end_padding_ms = int(
             mix_clip_end_padding_ms if mix_clip_end_padding_ms is not None else os.getenv("AT_MIX_CLIP_END_PADDING_MS", "150")
+        )
+        self.multipart_max_files = int(
+            multipart_max_files if multipart_max_files is not None else os.getenv("AT_MULTIPART_MAX_FILES", "20000")
+        )
+        self.multipart_max_fields = int(
+            multipart_max_fields if multipart_max_fields is not None else os.getenv("AT_MULTIPART_MAX_FIELDS", "4000")
         )
 
     @property

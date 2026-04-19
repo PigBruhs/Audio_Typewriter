@@ -229,6 +229,24 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(records), 5)
         self.assertEqual(next_sequence, 6)
 
+    def test_stage_vad_sources_from_folder_path_reads_local_audio_files(self) -> None:
+        local_root = Path(self.tempdir.name) / "local_input"
+        nested = local_root / "nested"
+        nested.mkdir(parents=True, exist_ok=True)
+        (local_root / "a.wav").write_bytes(b"a")
+        (nested / "b.mp3").write_bytes(b"b")
+        (nested / "ignore.txt").write_text("x", encoding="utf-8")
+
+        self.audio_base_service._probe_duration = lambda _path: 1.25  # type: ignore[method-assign]
+
+        source_dir, manifest, total_sec = self.audio_base_service.stage_vad_sources_from_folder_path("task-local", str(local_root))
+
+        self.assertEqual(Path(source_dir), local_root)
+        self.assertEqual(len(manifest), 2)
+        self.assertEqual(manifest[0]["file_name"], "a.wav")
+        self.assertEqual(manifest[1]["file_name"], "nested/b.mp3")
+        self.assertAlmostEqual(total_sec, 2.5, places=3)
+
     def test_task_pauses_when_asr_cuda_and_cpu_both_fail(self) -> None:
         queue_service = TaskQueueService(self.database, ASRService(self.settings), self.index_service, self.audio_base_service, self.settings)
         with queue_service._condition:

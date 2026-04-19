@@ -100,6 +100,11 @@ class AudioBaseImportResponse(BaseModel):
     discarded_task_count: int = 0
 
 
+class LocalAudioBaseImportRequest(BaseModel):
+    base_name: str = Field(..., min_length=1, max_length=64)
+    folder_path: str = Field(..., min_length=1, description="Local folder path containing .wav/.mp3 files")
+
+
 class AudioBaseListItem(BaseModel):
     base_name: str
     audio_count: int
