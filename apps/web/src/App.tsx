@@ -79,6 +79,8 @@ function App(): JSX.Element {
   const [selectedStats, setSelectedStats] = useState<AudioBaseItem | null>(null);
   const [mixSpeed, setMixSpeed] = useState(1);
   const [mixGapMs, setMixGapMs] = useState(100);
+  const [mixMode, setMixMode] = useState<"word" | "word_phrase" | "word_phrase_sentence">("word_phrase_sentence");
+  const [tailExtensionMs, setTailExtensionMs] = useState(20);
   const [sentence, setSentence] = useState("");
   const [result, setResult] = useState<string>("");
   const [importResult, setImportResult] = useState<string>("");
@@ -93,7 +95,11 @@ function App(): JSX.Element {
   const previousTasksRef = useRef<Record<string, QueueTask>>({});
   const mixSpeedError = Number.isFinite(mixSpeed) && mixSpeed > 0 ? "" : tt("速度必须大于 0。", "Speed must be greater than 0.");
   const mixGapError = Number.isFinite(mixGapMs) && mixGapMs >= 0 ? "" : tt("间隔必须大于或等于 0。", "Gap must be 0 or greater.");
-  const hasMixInputError = Boolean(mixSpeedError || mixGapError);
+  const tailExtensionError =
+    Number.isFinite(tailExtensionMs) && tailExtensionMs >= 0
+      ? ""
+      : tt("补尾必须大于或等于 0。", "Tail extension must be 0 or greater.");
+  const hasMixInputError = Boolean(mixSpeedError || mixGapError || tailExtensionError);
 
   function appendImportLog(message: string): void {
     setImportLogs((prev) => {
@@ -174,18 +180,8 @@ function App(): JSX.Element {
         appendImportLog(`[SYSTEM] ${task.base_name}: ${task.last_event}`);
       }
 
-      if (task.stage === "asr") {
-        if (task.processed_files !== prev.processed_files || task.next_sequence_number !== prev.next_sequence_number) {
-          appendImportLog(`[ASR] ${task.base_name}: ${task.processed_files}/${task.total_files}, next=${task.next_sequence_number}`);
-        }
-      } else if (task.stage === "vad") {
-        const currentSec = task.vad_processed_audio_sec ?? 0;
-        const prevSec = prev.vad_processed_audio_sec ?? 0;
-        const totalSec = task.vad_total_audio_sec ?? 0;
-        if (Math.abs(currentSec - prevSec) >= 0.1) {
-          appendImportLog(`[VAD] ${task.base_name}: ${currentSec.toFixed(1)}s/${totalSec.toFixed(1)}s`);
-        }
-      }
+      // Single-base pipeline no longer exposes meaningful fine-grained VAD/ASR progress;
+      // rely on status transitions and task events to avoid misleading bars.
     }
 
     previousTasksRef.current = next;
@@ -235,30 +231,22 @@ function App(): JSX.Element {
           appendImportLog("[PREP] completed.");
         }
         if (streamEvent.type === "vad_start") {
-          setImportProgressCurrent(streamEvent.processed_audio_sec);
-          setImportProgressTotal(streamEvent.total_audio_sec);
-          appendImportLog(`[VAD] start: ${streamEvent.processed_audio_sec.toFixed(1)}s / ${streamEvent.total_audio_sec.toFixed(1)}s`);
+          appendImportLog("[VAD] started.");
         }
         if (streamEvent.type === "vad_progress") {
-          setImportProgressCurrent(streamEvent.processed_audio_sec);
-          setImportProgressTotal(streamEvent.total_audio_sec);
-          appendImportLog(`[VAD] ${streamEvent.processed_audio_sec.toFixed(1)}s/${streamEvent.total_audio_sec.toFixed(1)}s | ${streamEvent.file_name}`);
+          appendImportLog("[VAD] running...");
         }
         if (streamEvent.type === "vad_complete") {
-          setImportProgressCurrent(streamEvent.processed_audio_sec);
-          setImportProgressTotal(streamEvent.total_audio_sec);
           appendImportLog("[VAD] completed.");
         }
         if (streamEvent.type === "overwrite") {
           appendImportLog(`[SYSTEM] Overwrite detected for base=${streamEvent.base_name}. Cleared files=${streamEvent.cleared_audio_files}, cleared indexed sources=${streamEvent.cleared_index_sources}.`);
         }
         if (streamEvent.type === "start") {
-          appendImportLog(`[ASR] queued: 0/${streamEvent.total} files`);
+          appendImportLog("[ASR] queued.");
         }
         if (streamEvent.type === "progress") {
-          setImportProgressCurrent(streamEvent.current);
-          setImportProgressTotal(streamEvent.total);
-          appendImportLog(`[ASR] ${streamEvent.current}/${streamEvent.total} | ${streamEvent.file_name} | tokens=${streamEvent.token_count}`);
+          appendImportLog(`[ASR] processed ${streamEvent.file_name} | tokens=${streamEvent.token_count}`);
         }
         if (streamEvent.type === "complete") {
           setImportProgressCurrent(streamEvent.result.ingested_source_count);
@@ -403,7 +391,7 @@ function App(): JSX.Element {
     setLoading(true);
     setResult("");
     try {
-      const data = await requestMix(selectedBase, sentence, mixSpeed, mixGapMs);
+      const data = await requestMix(selectedBase, sentence, mixSpeed, mixGapMs, mixMode, tailExtensionMs);
       setResult(tt(`音频库=${selectedBase}, 任务=${data.job_id}, 状态=${data.status}`, `base=${selectedBase}, job=${data.job_id}, status=${data.status}`));
       appendImportLog(`[${mixTag}] base=${selectedBase}, job=${data.job_id}, status=${data.status}`);
     } catch (error) {
@@ -526,6 +514,30 @@ function App(): JSX.Element {
             />
             {mixGapError && <div style={{ color: "crimson", fontSize: 12 }}>{mixGapError}</div>}
           </label>
+          <label>
+            {tt("拼接模式", "Mix Mode")}
+            <select
+              value={mixMode}
+              onChange={(event) => setMixMode(event.target.value as "word" | "word_phrase" | "word_phrase_sentence")}
+              style={{ width: "100%" }}
+            >
+              <option value="word">{tt("词级", "Word")}</option>
+              <option value="word_phrase">{tt("词 + 短语", "Word + Phrase")}</option>
+              <option value="word_phrase_sentence">{tt("词 + 短语 + 句子", "Word + Phrase + Sentence")}</option>
+            </select>
+          </label>
+          <label>
+            {tt("补尾随机上限 (ms)", "Tail Extension Max (ms)")}
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={tailExtensionMs}
+              onChange={(event) => setTailExtensionMs(Number(event.target.value))}
+              style={{ width: "100%" }}
+            />
+            {tailExtensionError && <div style={{ color: "crimson", fontSize: 12 }}>{tailExtensionError}</div>}
+          </label>
         </div>
         <button type="submit" disabled={loading || !selectedBase || sentence.trim().length === 0 || hasMixInputError}>
           {loading ? tt("提交中...", "Submitting...") : tt("创建活字印刷任务", "Create Mix Job")}
@@ -545,27 +557,27 @@ function App(): JSX.Element {
               <div><strong>{task.base_name}</strong> [{formatTaskStatus(task.status)}] {formatStage(task.stage)}</div>
               {task.stage === "vad" ? (
                 <>
-                  <div>
-                    {tt("VAD 进度", "VAD Progress")}: {(task.vad_processed_audio_sec ?? 0).toFixed(1)}s/{(task.vad_total_audio_sec ?? 0).toFixed(1)}s
-                  </div>
                   <div>{tt("VAD 用时", "VAD Elapsed")}: {(task.vad_elapsed_sec ?? 0).toFixed(1)}s</div>
-                  <progress
-                    {...clampProgress(task.vad_processed_audio_sec ?? 0, task.vad_total_audio_sec ?? 0)}
-                    style={{ width: "100%", marginTop: 4 }}
-                  />
+                  <div>{tt("音频总时长", "Audio Duration")}: {(task.vad_total_audio_sec ?? 0).toFixed(1)}s</div>
                 </>
               ) : (
                 <>
-                  <div>{tt("ASR 进度", "ASR Progress")}: {task.processed_files}/{task.total_files}, next={task.next_sequence_number}</div>
                   <div>{tt("ASR 用时", "ASR Elapsed")}: {(task.asr_elapsed_sec ?? 0).toFixed(1)}s</div>
-                  <progress
-                    {...clampProgress(task.processed_files, task.total_files)}
-                    style={{ width: "100%", marginTop: 4 }}
-                  />
+                  <div>
+                    {tt("ASR 进度", "ASR Progress")}: {(task.asr_processed_audio_sec ?? 0).toFixed(1)}s/
+                    {(task.asr_total_audio_sec ?? 0).toFixed(1)}s
+                  </div>
+                  {(task.asr_total_audio_sec ?? 0) > 0 && (
+                    <progress
+                      {...clampProgress(task.asr_processed_audio_sec ?? 0, task.asr_total_audio_sec ?? 0)}
+                      style={{ width: "100%", marginTop: 4 }}
+                    />
+                  )}
+                  <div>{tt("累计 token", "Accumulated tokens")}: {task.token_count}</div>
                 </>
               )}
               {task.last_error && <div style={{ color: "crimson" }}>{tt("错误", "Error")}: {task.last_error}</div>}
-              {task.status === "running" && (
+              {task.status === "running" && task.stage !== "asr" && (
                 <button type="button" onClick={() => onPauseTask(task.task_id)}>{tt("暂停", "Pause")}</button>
               )}
               {(task.status === "paused" || task.status === "failed" || task.status === "queued") && (

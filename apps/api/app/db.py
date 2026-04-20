@@ -399,7 +399,7 @@ class SQLiteDatabase:
                     FROM word_occurrences wo
                     JOIN audio_sources src ON src.source_audio_id = wo.source_audio_id
                     WHERE wo.normalized_token = ? AND src.base_name = ?
-                    ORDER BY wo.confidence DESC, wo.start_sec ASC, wo.id ASC
+                    ORDER BY wo.start_sec ASC, wo.id ASC
                     LIMIT ?
                     """,
                     (normalized_token, base_name, limit),
@@ -412,7 +412,7 @@ class SQLiteDatabase:
                     FROM word_occurrences wo
                     JOIN audio_sources src ON src.source_audio_id = wo.source_audio_id
                     WHERE wo.normalized_token = ? AND src.base_name = ?
-                    ORDER BY wo.confidence DESC, wo.start_sec ASC, wo.id ASC
+                    ORDER BY wo.start_sec ASC, wo.id ASC
                     """,
                     (normalized_token, base_name),
                 ).fetchall()
@@ -423,7 +423,7 @@ class SQLiteDatabase:
                            confidence, segment_index, word_index
                     FROM word_occurrences
                     WHERE normalized_token = ?
-                    ORDER BY confidence DESC, start_sec ASC, id ASC
+                    ORDER BY start_sec ASC, id ASC
                     LIMIT ?
                     """,
                     (normalized_token, limit),
@@ -435,7 +435,7 @@ class SQLiteDatabase:
                            confidence, segment_index, word_index
                     FROM word_occurrences
                     WHERE normalized_token = ?
-                    ORDER BY confidence DESC, start_sec ASC, id ASC
+                    ORDER BY start_sec ASC, id ASC
                     """,
                     (normalized_token,),
                 ).fetchall()
@@ -502,7 +502,7 @@ class SQLiteDatabase:
             where_clause += " AND src.base_name = ?"
             params.append(base_name)
 
-        sql += f"WHERE {where_clause} ORDER BY confidence DESC, start_sec ASC"
+        sql += f"WHERE {where_clause} ORDER BY start_sec ASC, start_word_index ASC"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -525,6 +525,73 @@ class SQLiteDatabase:
                 segment_index=int(row["segment_index"]),
                 start_word_index=int(row["start_word_index"]),
                 end_word_index=int(row["end_word_index"]),
+            )
+            for row in rows
+        ]
+
+    def find_best_sentence_segment(self, normalized_tokens: list[str], *, base_name: str | None = None) -> tuple[str, int] | None:
+        unique_tokens = sorted({str(token).strip() for token in normalized_tokens if str(token).strip()})
+        if not unique_tokens:
+            return None
+
+        placeholders = ", ".join("?" for _ in unique_tokens)
+        sql = (
+            "SELECT wo.source_audio_id AS source_audio_id, "
+            "wo.segment_index AS segment_index, "
+            "COUNT(1) AS token_hits, "
+            "MIN(wo.start_sec) AS first_start "
+            "FROM word_occurrences wo "
+        )
+        params: list[object] = [*unique_tokens]
+        if base_name:
+            sql += "JOIN audio_sources src ON src.source_audio_id = wo.source_audio_id "
+        sql += f"WHERE wo.normalized_token IN ({placeholders}) "
+        if base_name:
+            sql += "AND src.base_name = ? "
+            params.append(base_name)
+        sql += (
+            "GROUP BY wo.source_audio_id, wo.segment_index "
+            "ORDER BY token_hits DESC, first_start ASC "
+            "LIMIT 1"
+        )
+
+        connection = self.connect()
+        try:
+            row = connection.execute(sql, params).fetchone()
+        finally:
+            connection.close()
+
+        if row is None:
+            return None
+        return str(row["source_audio_id"]), int(row["segment_index"])
+
+    def list_segment_words(self, source_audio_id: str, segment_index: int) -> list[WordOccurrenceRecord]:
+        connection = self.connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT id, source_audio_id, token, normalized_token, start_sec, end_sec,
+                       confidence, segment_index, word_index
+                FROM word_occurrences
+                WHERE source_audio_id = ? AND segment_index = ?
+                ORDER BY word_index ASC, id ASC
+                """,
+                (source_audio_id, int(segment_index)),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        return [
+            WordOccurrenceRecord(
+                id=row["id"],
+                source_audio_id=row["source_audio_id"],
+                token=row["token"],
+                normalized_token=row["normalized_token"],
+                start_sec=float(row["start_sec"]),
+                end_sec=float(row["end_sec"]),
+                confidence=float(row["confidence"]),
+                segment_index=int(row["segment_index"]),
+                word_index=int(row["word_index"]),
             )
             for row in rows
         ]
@@ -583,6 +650,22 @@ class SQLiteDatabase:
         if row is None:
             return None
         return str(row["source_path"])
+
+    def get_audio_source_duration_for_base(self, source_audio_id: str, base_name: str) -> float | None:
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                "SELECT duration_sec FROM audio_base_files WHERE source_audio_id = ? AND base_name = ?",
+                (source_audio_id, base_name),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        try:
+            return float(row["duration_sec"])
+        except (TypeError, ValueError):
+            return None
 
 
     def get_base_index_summary(self, base_name: str) -> dict[str, int]:

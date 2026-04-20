@@ -17,6 +17,7 @@ from app.services.audio_base_service import AudioBaseService
 from app.services.index_service import IndexService
 from app.services.mixing_service import MixingService
 from app.services.task_queue_service import QueueTask, TaskQueueService
+from app.text import tokenize_sentence
 
 
 class PipelineTests(unittest.TestCase):
@@ -56,6 +57,13 @@ class PipelineTests(unittest.TestCase):
             self.settings.resolve_model_name("base", "en", model_name="Systran/faster-whisper-large-v3"),
             "Systran/faster-whisper-large-v3",
         )
+
+    def test_resolve_model_name_for_chinese_uses_multilingual_tier(self) -> None:
+        self.assertEqual(self.settings.resolve_model_name("base", "zh"), "base")
+
+    def test_tokenize_sentence_supports_chinese(self) -> None:
+        tokens = tokenize_sentence("你好 world")
+        self.assertEqual(tokens, ["你", "好", "world"])
 
     def test_resolve_local_prefixed_model_directory(self) -> None:
         local_model_dir = self.settings.asr_model_cache_dir / "faster-whisper-large-v3"
@@ -185,6 +193,89 @@ class PipelineTests(unittest.TestCase):
         self.assertAlmostEqual(occurrences[0].end_sec, 0.2, places=3)
         self.assertAlmostEqual(occurrences[1].end_sec, 0.5, places=3)
 
+    def test_mfa_alignment_backend_updates_word_timestamps(self) -> None:
+        class DummyWord:
+            def __init__(self, text: str, start: float, end: float, prob: float) -> None:
+                self.word = text
+                self.start = start
+                self.end = end
+                self.probability = prob
+
+        class DummySegment:
+            def __init__(self, words, end: float) -> None:
+                self.words = words
+                self.end = end
+
+        class DummyModel:
+            def transcribe(self, *_args, **_kwargs):
+                return [DummySegment([DummyWord("hello", 0.0, 0.2, 0.9), DummyWord("world", 0.3, 0.5, 0.9)], 0.5)], None
+
+        def fake_factory(*_args, **_kwargs):
+            return DummyModel()
+
+        settings = Settings(
+            data_dir=Path(self.tempdir.name) / "data_mfa",
+            database_path=Path(self.tempdir.name) / "db_mfa.sqlite3",
+            mix_output_dir=Path(self.tempdir.name) / "mixes_mfa",
+            audio_base_dir=Path(self.tempdir.name) / "audio_base_mfa",
+            temp_dir=Path(self.tempdir.name) / "temp_mfa",
+            asr_model_cache_dir=Path(self.tempdir.name) / "models_mfa",
+            asr_device="cpu",
+            asr_alignment_backend="mfa",
+            asr_mfa_dictionary_path=Path(self.tempdir.name) / "dummy.dict",
+            asr_mfa_acoustic_model_path=Path(self.tempdir.name) / "dummy.zip",
+        )
+
+        service = ASRService(settings, model_factory=fake_factory)
+        service._cuda_available = lambda: False  # type: ignore[method-assign]
+        service._run_mfa_alignment = lambda **_kwargs: [  # type: ignore[method-assign]
+            (0.05, 0.25, "hello"),
+            (0.31, 0.61, "world"),
+        ]
+
+        occurrences = service.transcribe("demo.wav", language="en", model_tier="large")
+        self.assertEqual(len(occurrences), 2)
+        self.assertAlmostEqual(occurrences[0].start_sec, 0.05, places=3)
+        self.assertAlmostEqual(occurrences[0].end_sec, 0.25, places=3)
+        self.assertAlmostEqual(occurrences[1].start_sec, 0.31, places=3)
+        self.assertAlmostEqual(occurrences[1].end_sec, 0.61, places=3)
+
+    def test_parse_textgrid_word_intervals(self) -> None:
+        service = ASRService(self.settings, model_factory=None)
+        payload = """
+        item [1]:
+            class = \"IntervalTier\"
+            name = \"words\"
+            intervals [1]:
+                xmin = 0
+                xmax = 0.2
+                text = \"hello\"
+            intervals [2]:
+                xmin = 0.2
+                xmax = 0.5
+                text = \"world\"
+        """
+        intervals = service._parse_textgrid_word_intervals(payload)
+        self.assertEqual(len(intervals), 2)
+        self.assertEqual(intervals[0][2], "hello")
+        self.assertAlmostEqual(intervals[1][1], 0.5, places=3)
+
+    def test_apply_selected_alignment_skips_chinese(self) -> None:
+        service = ASRService(self.settings, model_factory=None)
+        occurrences = [
+            WordOccurrenceRecord(None, "demo", "你", "你", 0.0, 0.1, 0.9, 0, 0),
+        ]
+        runtime_events: list[str] = []
+        result = service._apply_selected_alignment(
+            source_path="demo.wav",
+            language="zh",
+            occurrences=occurrences,
+            segments=[{"start": 0.0, "end": 0.1, "text": "你"}],
+            runtime_events=runtime_events,
+        )
+        self.assertEqual(result, occurrences)
+        self.assertTrue(any("direct ASR timestamps" in event for event in runtime_events))
+
     def test_vad_merges_segments_to_min_duration_and_appends_short_tail(self) -> None:
         segments = [
             (0.0, 6.0),
@@ -238,12 +329,14 @@ class PipelineTests(unittest.TestCase):
 
         self.audio_base_service._probe_duration = lambda _path: 1.25  # type: ignore[method-assign]
 
-        source_dir, manifest, total_sec = self.audio_base_service.stage_vad_sources_from_folder_path("task-local", str(local_root))
+        source_paths, manifest, total_sec = self.audio_base_service.stage_vad_sources_from_folder_path(
+            "demo_base",
+            str(local_root),
+        )
 
-        staged_dir = Path(source_dir)
-        self.assertEqual(staged_dir, self.audio_base_service.vad_job_dir("task-local") / "sources")
-        self.assertTrue((staged_dir / "a.wav").exists())
-        self.assertTrue((staged_dir / "nested" / "b.mp3").exists())
+        self.assertEqual(len(source_paths), 2)
+        self.assertEqual(Path(source_paths[0]).name, "a.wav")
+        self.assertEqual(Path(source_paths[1]).name, "b.mp3")
         self.assertEqual(len(manifest), 2)
         self.assertEqual(manifest[0]["file_name"], "a.wav")
         self.assertEqual(manifest[1]["file_name"], "nested/b.mp3")
@@ -293,6 +386,7 @@ class PipelineTests(unittest.TestCase):
             vad_total_audio_sec=1.0,
             vad_processed_audio_sec=1.0,
             vad_source_dir=None,
+            vad_source_paths=[],
             vad_total_sources=0,
             vad_next_source_index=1,
             vad_next_segment_index=0,
@@ -351,6 +445,119 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(plan.missing_tokens, [])
         self.assertEqual(len(plan.items), 1)
         self.assertEqual(plan.items[0].token, "hello world")
+
+    def test_mix_plan_prefers_whole_sentence_direct_pass(self) -> None:
+        audio_source = AudioSourceRecord(
+            source_audio_id="clip-long.wav",
+            base_name="demo_base",
+            source_path="clip-long.wav",
+            language="en",
+            model_tier="base",
+            device="cuda",
+            compute_type="float16",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        occurrences = [
+            WordOccurrenceRecord(None, "clip-long.wav", "hello", "hello", 0.00, 0.20, 0.90, 0, 0),
+            WordOccurrenceRecord(None, "clip-long.wav", "audio", "audio", 0.20, 0.40, 0.90, 0, 1),
+            WordOccurrenceRecord(None, "clip-long.wav", "typewriter", "typewriter", 0.40, 0.62, 0.90, 0, 2),
+            WordOccurrenceRecord(None, "clip-long.wav", "works", "works", 0.62, 0.80, 0.90, 0, 3),
+            WordOccurrenceRecord(None, "clip-long.wav", "well", "well", 0.80, 1.00, 0.90, 0, 4),
+        ]
+        self.index_service.ingest(audio_source, occurrences)
+
+        plan = self.mixing_service.build_mix_plan("hello audio typewriter works well", base_name="demo_base")
+        self.assertEqual(plan.missing_tokens, [])
+        self.assertEqual(len(plan.items), 1)
+        self.assertEqual(plan.items[0].source_audio_id, "clip-long.wav")
+        self.assertAlmostEqual(plan.items[0].start_sec, 0.0, places=3)
+        self.assertAlmostEqual(plan.items[0].end_sec, 1.0, places=3)
+
+    def test_mix_plan_word_mode_disables_phrase_and_sentence(self) -> None:
+        source = AudioSourceRecord(
+            source_audio_id="demo_base:000050",
+            base_name="demo_base",
+            source_path="audio_base/demo_base/000050.wav",
+            language="en",
+            model_tier="base",
+            device="cpu",
+            compute_type="int8",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        self.index_service.ingest(
+            source,
+            [
+                WordOccurrenceRecord(None, "demo_base:000050", "hello", "hello", 0.0, 0.2, 0.9, 0, 0),
+                WordOccurrenceRecord(None, "demo_base:000050", "world", "world", 0.3, 0.5, 0.9, 0, 1),
+            ],
+        )
+
+        plan = self.mixing_service.build_mix_plan("hello world", base_name="demo_base", mix_mode="word")
+        self.assertEqual(len(plan.items), 2)
+        self.assertEqual(plan.items[0].token, "hello")
+        self.assertEqual(plan.items[1].token, "world")
+
+    def test_render_plan_applies_tail_extension_with_source_end_guard(self) -> None:
+        now = "2026-01-01T00:00:00+00:00"
+        source = AudioSourceRecord(
+            source_audio_id="demo_base:000099",
+            base_name="demo_base",
+            source_path="audio_base/demo_base/000099.wav",
+            language="en",
+            model_tier="base",
+            device="cpu",
+            compute_type="int8",
+            created_at=now,
+            updated_at=now,
+        )
+        self.database.upsert_audio_source(source)
+        self.index_service.ingest(
+            source,
+            [WordOccurrenceRecord(None, "demo_base:000099", "hello", "hello", 0.0, 0.2, 0.9, 0, 0)],
+        )
+        self.database.create_audio_base(
+            AudioBaseRecord(
+                base_name="demo_base",
+                base_path=str(self.settings.audio_base_dir / "demo_base"),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        self.database.replace_audio_base_files(
+            "demo_base",
+            [
+                AudioBaseFileRecord(
+                    source_audio_id="demo_base:000099",
+                    base_name="demo_base",
+                    sequence_number=1,
+                    file_name="000099.wav",
+                    file_path="audio_base/demo_base/000099.wav",
+                    duration_sec=0.215,
+                    file_size_bytes=1,
+                    created_at=now,
+                )
+            ],
+        )
+
+        plan = self.mixing_service.build_mix_plan("hello", base_name="demo_base", job_id="tail-job", mix_mode="word")
+        with patch("app.services.mixing_service.subprocess.run") as run_mock, patch(
+            "app.services.mixing_service.random.Random.uniform", return_value=0.05
+        ):
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = ""
+            run_mock.return_value.stderr = ""
+
+            self.mixing_service.render_plan(
+                plan,
+                base_name="demo_base",
+                tail_extension_ms=20,
+            )
+
+            command = run_mock.call_args.args[0]
+            filter_graph = command[command.index("-filter_complex") + 1]
+            self.assertIn("atrim=start=0.000:end=0.215", filter_graph)
 
     def test_mix_sentence_reports_missing_tokens(self) -> None:
         audio_source = AudioSourceRecord(
@@ -463,7 +670,7 @@ class PipelineTests(unittest.TestCase):
             filter_graph = command[command.index("-filter_complex") + 1]
             self.assertIn("atempo=1.500000", filter_graph)
 
-    def test_mix_plan_first_word_uses_highest_confidence(self) -> None:
+    def test_mix_plan_first_word_sentence_seed_uses_best_segment(self) -> None:
         source_a = AudioSourceRecord(
             source_audio_id="demo_base:000001",
             base_name="demo_base",
@@ -486,12 +693,18 @@ class PipelineTests(unittest.TestCase):
             created_at="2026-01-01T00:00:00+00:00",
             updated_at="2026-01-01T00:00:00+00:00",
         )
-        self.index_service.ingest(source_a, [WordOccurrenceRecord(None, "demo_base:000001", "hello", "hello", 0.0, 0.2, 0.70, 0, 0)])
-        self.index_service.ingest(source_b, [WordOccurrenceRecord(None, "demo_base:000002", "hello", "hello", 0.1, 0.3, 0.95, 0, 0)])
+        self.index_service.ingest(
+            source_a,
+            [
+                WordOccurrenceRecord(None, "demo_base:000001", "hello", "hello", 0.0, 0.2, 0.10, 0, 0),
+                WordOccurrenceRecord(None, "demo_base:000001", "world", "world", 0.2, 0.4, 0.10, 0, 1),
+            ],
+        )
+        self.index_service.ingest(source_b, [WordOccurrenceRecord(None, "demo_base:000002", "hello", "hello", 0.1, 0.3, 0.99, 0, 0)])
 
-        plan = self.mixing_service.build_mix_plan("hello", base_name="demo_base", job_id="job-first-conf")
+        plan = self.mixing_service.build_mix_plan("hello world", base_name="demo_base", job_id="job-first-seed")
         self.assertEqual(len(plan.items), 1)
-        self.assertEqual(plan.items[0].source_audio_id, "demo_base:000002")
+        self.assertEqual(plan.items[0].source_audio_id, "demo_base:000001")
 
     def test_mix_plan_prefers_same_source_nearest_timestamp_after_first_word(self) -> None:
         source_a = AudioSourceRecord(
@@ -531,7 +744,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(plan.items[0].source_audio_id, "demo_base:000001")
         self.assertAlmostEqual(plan.items[0].start_sec, 1.0, places=3)
 
-    def test_mix_plan_falls_back_to_global_highest_confidence_when_same_source_missing(self) -> None:
+    def test_mix_plan_falls_back_to_global_random_when_same_source_missing(self) -> None:
         source_a = AudioSourceRecord(
             source_audio_id="demo_base:000001",
             base_name="demo_base",
@@ -566,13 +779,13 @@ class PipelineTests(unittest.TestCase):
             updated_at="2026-01-01T00:00:00+00:00",
         )
         self.index_service.ingest(source_a, [WordOccurrenceRecord(None, "demo_base:000001", "hello", "hello", 0.0, 0.2, 0.95, 0, 0)])
-        self.index_service.ingest(source_b, [WordOccurrenceRecord(None, "demo_base:000002", "world", "world", 0.2, 0.4, 0.99, 0, 0)])
-        self.index_service.ingest(source_c, [WordOccurrenceRecord(None, "demo_base:000003", "world", "world", 0.3, 0.5, 0.80, 0, 0)])
+        self.index_service.ingest(source_b, [WordOccurrenceRecord(None, "demo_base:000002", "world", "world", 0.2, 0.4, 0.20, 0, 0)])
+        self.index_service.ingest(source_c, [WordOccurrenceRecord(None, "demo_base:000003", "world", "world", 0.3, 0.5, 0.99, 0, 0)])
 
         plan = self.mixing_service.build_mix_plan("hello world", base_name="demo_base", job_id="job-2")
         self.assertEqual(len(plan.items), 2)
         self.assertEqual(plan.items[0].source_audio_id, "demo_base:000001")
-        self.assertEqual(plan.items[1].source_audio_id, "demo_base:000002")
+        self.assertIn(plan.items[1].source_audio_id, {"demo_base:000002", "demo_base:000003"})
 
     def test_audio_base_import_overwrites_existing_base(self) -> None:
         def fake_split(
@@ -726,6 +939,7 @@ class PipelineTests(unittest.TestCase):
             vad_total_audio_sec=5.0,
             vad_processed_audio_sec=5.0,
             vad_source_dir=None,
+            vad_source_paths=[],
             vad_total_sources=0,
             vad_next_source_index=1,
             vad_next_segment_index=0,
@@ -764,6 +978,7 @@ class PipelineTests(unittest.TestCase):
             vad_total_audio_sec=12.0,
             vad_processed_audio_sec=12.0,
             vad_source_dir=None,
+            vad_source_paths=[],
             vad_total_sources=0,
             vad_next_source_index=1,
             vad_next_segment_index=0,
@@ -839,6 +1054,7 @@ class PipelineTests(unittest.TestCase):
             vad_total_audio_sec=3.0,
             vad_processed_audio_sec=3.0,
             vad_source_dir=None,
+            vad_source_paths=[],
             vad_total_sources=0,
             vad_next_source_index=1,
             vad_next_segment_index=0,
@@ -995,6 +1211,7 @@ class PipelineTests(unittest.TestCase):
             vad_total_audio_sec=0.0,
             vad_processed_audio_sec=0.0,
             vad_source_dir=str(vad_job_dir / "sources"),
+            vad_source_paths=[],
             vad_total_sources=0,
             vad_next_source_index=1,
             vad_next_segment_index=0,

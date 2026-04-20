@@ -16,7 +16,12 @@ class Settings:
         asr_compute_type: str | None = None,
         asr_cpu_compute_type: str | None = None,
         asr_default_model: str | None = None,
+        asr_default_language: str | None = None,
+        asr_alignment_backend: str | None = None,
         asr_model_cache_dir: str | Path | None = None,
+        asr_mfa_binary: str | None = None,
+        asr_mfa_dictionary_path: str | Path | None = None,
+        asr_mfa_acoustic_model_path: str | Path | None = None,
         asr_beam_size: int | None = None,
         asr_preload_model: str | None = None,
         ffmpeg_binary: str | None = None,
@@ -43,7 +48,14 @@ class Settings:
         self.asr_compute_type = asr_compute_type or os.getenv("AT_ASR_COMPUTE_TYPE", "float16")
         self.asr_cpu_compute_type = asr_cpu_compute_type or os.getenv("AT_ASR_CPU_COMPUTE_TYPE", "int8")
         self.asr_default_model = asr_default_model or os.getenv("AT_ASR_DEFAULT_MODEL", "large-v3")
+        self.asr_default_language = (asr_default_language or os.getenv("AT_ASR_DEFAULT_LANGUAGE", "en")).lower()
+        self.asr_alignment_backend = (asr_alignment_backend or os.getenv("AT_ASR_ALIGNMENT_BACKEND", "whisperx")).lower()
         self.asr_model_cache_dir = Path(asr_model_cache_dir or os.getenv("AT_ASR_MODEL_CACHE_DIR", "./models"))
+        self.asr_mfa_binary = asr_mfa_binary or os.getenv("AT_ASR_MFA_BINARY", "mfa")
+        mfa_dict_raw = str(asr_mfa_dictionary_path or os.getenv("AT_ASR_MFA_DICTIONARY_PATH", "")).strip()
+        mfa_model_raw = str(asr_mfa_acoustic_model_path or os.getenv("AT_ASR_MFA_ACOUSTIC_MODEL_PATH", "")).strip()
+        self.asr_mfa_dictionary_path = Path(mfa_dict_raw) if mfa_dict_raw else None
+        self.asr_mfa_acoustic_model_path = Path(mfa_model_raw) if mfa_model_raw else None
         self.asr_beam_size = int(asr_beam_size or os.getenv("AT_ASR_BEAM_SIZE", "5"))
         self.asr_preload_model = asr_preload_model or os.getenv("AT_ASR_PRELOAD_MODEL", "")
         self.ffmpeg_binary = ffmpeg_binary or os.getenv("AT_FFMPEG_BINARY", "ffmpeg")
@@ -108,22 +120,31 @@ class Settings:
 
     def resolve_model_name(self, model_tier: str, language: str, model_name: str | None = None) -> str:
         language = (language or "en").lower()
-        if language != "en":
-            raise ValueError("Current scaffold only supports English ASR.")
 
         if model_name and model_name.strip():
             return self._resolve_local_model_candidate(model_name.strip()) or model_name.strip()
 
         model_tier = (model_tier or self.asr_default_model).strip().lower()
-        model_map = {
-            "tiny": "tiny.en",
-            "base": "base.en",
-            "small": "small.en",
-            "medium": "medium.en",
-            "large": "large-v3",
-            "xlarge": "large-v3",
-            "xxlarge": "large-v3",
-        }
+        if language == "en":
+            model_map = {
+                "tiny": "tiny.en",
+                "base": "base.en",
+                "small": "small.en",
+                "medium": "medium.en",
+                "large": "large-v3",
+                "xlarge": "large-v3",
+                "xxlarge": "large-v3",
+            }
+        else:
+            model_map = {
+                "tiny": "tiny",
+                "base": "base",
+                "small": "small",
+                "medium": "medium",
+                "large": "large-v3",
+                "xlarge": "large-v3",
+                "xxlarge": "large-v3",
+            }
         if model_tier in model_map:
             mapped_name = model_map[model_tier]
             return self._resolve_local_model_candidate(mapped_name) or mapped_name

@@ -106,6 +106,23 @@ Set-Location "E:\Audio_Typewriter"
 Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/models/download" -Method POST -ContentType "application/json" -Body '{"model_tier":"large"}'
 ```
 
+## Optional: MFA High-Precision Word Timestamps
+
+The backend now supports `Montreal Forced Aligner (MFA)` as an alignment backend for higher-precision word timestamps.
+
+Set these environment variables before starting the API:
+
+```powershell
+$env:AT_ASR_ALIGNMENT_BACKEND="mfa"
+$env:AT_ASR_MFA_BINARY="mfa"
+$env:AT_ASR_MFA_DICTIONARY_PATH="E:\models\mfa\english_us_arpa.dict"
+$env:AT_ASR_MFA_ACOUSTIC_MODEL_PATH="E:\models\mfa\english_us_arpa.zip"
+```
+
+Notes:
+- If MFA is not installed, missing assets, or alignment fails, the service keeps original ASR timestamps.
+- `AT_ASR_ALIGNMENT_BACKEND="auto"` tries MFA first, then falls back to WhisperX alignment.
+
 ## API Flow
 
 1. `POST /api/v1/models/download`

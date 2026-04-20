@@ -62,6 +62,8 @@ export type QueueTask = {
   updated_at: string;
   vad_elapsed_sec?: number;
   asr_elapsed_sec?: number;
+  asr_total_audio_sec?: number;
+  asr_processed_audio_sec?: number;
   last_error?: string | null;
   last_event?: string | null;
   overwritten?: boolean;
@@ -117,7 +119,9 @@ export async function requestMix(
   baseName: string,
   sentence: string,
   speedMultiplier: number,
-  gapMs: number
+  gapMs: number,
+  mixMode: "word" | "word_phrase" | "word_phrase_sentence",
+  tailExtensionMs: number
 ): Promise<MixResponse> {
   const response = await fetch("/api/v1/mix", {
     method: "POST",
@@ -129,6 +133,8 @@ export async function requestMix(
       sentence,
       speed_multiplier: speedMultiplier,
       gap_ms: gapMs,
+      mix_mode: mixMode,
+      tail_extension_ms: tailExtensionMs,
     }),
   });
 

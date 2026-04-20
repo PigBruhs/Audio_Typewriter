@@ -63,6 +63,19 @@ class AudioBaseService:
     def clear_vad_job_storage(self, task_id: str) -> None:
         shutil.rmtree(self.vad_job_dir(task_id), ignore_errors=True)
 
+    def clear_staged_sources(self, base_name: str) -> None:
+        shutil.rmtree(self.base_path(base_name) / "_sources", ignore_errors=True)
+
+    def clear_vad_suffix_files(self, base_name: str) -> int:
+        removed = 0
+        for file_path in self.base_path(base_name).glob("*_vad.wav"):
+            try:
+                file_path.unlink()
+                removed += 1
+            except FileNotFoundError:
+                continue
+        return removed
+
     def update_base_metadata(self, base_name: str, patch: dict[str, object]) -> Path:
         metadata_path = self.base_metadata_path(base_name)
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
@@ -484,20 +497,21 @@ class AudioBaseService:
 
     def stage_vad_sources(
         self,
-        task_id: str,
+        base_name: str,
         files: list[UploadFile],
         progress_callback: Callable[[dict[str, object]], None] | None = None,
-    ) -> tuple[str, list[dict[str, object]], float]:
+    ) -> tuple[list[Path], list[dict[str, object]], float]:
         filtered = [file for file in files if Path(file.filename or "").suffix.lower() in _ALLOWED_EXTENSIONS]
         if not filtered:
             raise ValueError("No .wav or .mp3 files were provided.")
 
         filtered.sort(key=lambda item: (item.filename or "").lower())
-        job_dir = self.vad_job_dir(task_id)
-        source_dir = job_dir / "sources"
+        source_dir = self.base_path(base_name) / "_sources"
+        shutil.rmtree(source_dir, ignore_errors=True)
         source_dir.mkdir(parents=True, exist_ok=True)
 
         manifest: list[dict[str, object]] = []
+        source_paths: list[Path] = []
         total_audio_sec = 0.0
         total_files = len(filtered)
         if progress_callback:
@@ -515,6 +529,7 @@ class AudioBaseService:
             upload.file.seek(0)
             with source_path.open("wb") as destination:
                 shutil.copyfileobj(upload.file, destination)
+            source_paths.append(source_path)
             duration_sec = self._probe_duration(source_path)
             total_audio_sec += duration_sec
             manifest.append(
@@ -534,7 +549,6 @@ class AudioBaseService:
                     }
                 )
 
-        (job_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         if progress_callback:
             progress_callback(
                 {
@@ -543,14 +557,14 @@ class AudioBaseService:
                     "migrated_files": total_files,
                 }
             )
-        return str(source_dir), manifest, round(total_audio_sec, 3)
+        return source_paths, manifest, round(total_audio_sec, 3)
 
     def stage_vad_sources_from_folder_path(
         self,
-        task_id: str,
+        _base_name: str,
         folder_path: str,
         progress_callback: Callable[[dict[str, object]], None] | None = None,
-    ) -> tuple[str, list[dict[str, object]], float]:
+    ) -> tuple[list[Path], list[dict[str, object]], float]:
         root_dir = Path(folder_path).expanduser()
         if not root_dir.exists() or not root_dir.is_dir():
             raise ValueError(f"Folder was not found or is not a directory: {folder_path}")
@@ -560,9 +574,6 @@ class AudioBaseService:
             raise ValueError("No .wav or .mp3 files were found in the selected folder.")
 
         all_files.sort(key=lambda item: item.relative_to(root_dir).as_posix().lower())
-        job_dir = self.vad_job_dir(task_id)
-        source_dir = job_dir / "sources"
-        source_dir.mkdir(parents=True, exist_ok=True)
 
         total_files = len(all_files)
         if progress_callback:
@@ -575,14 +586,13 @@ class AudioBaseService:
             )
 
         manifest: list[dict[str, object]] = []
+        source_paths: list[Path] = []
         total_audio_sec = 0.0
         for index, source_path in enumerate(all_files, start=1):
             relative_name = source_path.relative_to(root_dir).as_posix()
-            staged_path = source_dir / relative_name
-            staged_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, staged_path)
+            source_paths.append(source_path)
 
-            duration_sec = self._probe_duration(staged_path)
+            duration_sec = self._probe_duration(source_path)
             total_audio_sec += duration_sec
             manifest.append(
                 {
@@ -601,7 +611,6 @@ class AudioBaseService:
                     }
                 )
 
-        (job_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         if progress_callback:
             progress_callback(
                 {
@@ -610,7 +619,7 @@ class AudioBaseService:
                     "migrated_files": total_files,
                 }
             )
-        return str(source_dir), manifest, round(total_audio_sec, 3)
+        return source_paths, manifest, round(total_audio_sec, 3)
 
     def load_vad_manifest(self, task_id: str) -> list[dict[str, object]]:
         manifest_path = self.vad_job_dir(task_id) / "manifest.json"

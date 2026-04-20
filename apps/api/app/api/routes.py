@@ -121,14 +121,14 @@ def _run_audio_base_import(
             progress_callback({"type": "status", "message": message})
 
     try:
-        source_dir, manifest, total_audio_sec = _audio_base_service.stage_vad_sources(
-            task_id,
+        source_paths, manifest, total_audio_sec = _audio_base_service.stage_vad_sources(
+            normalized_base_name,
             files,
             progress_callback=_on_preprocess_progress,
         )
         queued_task = _task_queue_service.activate_vad_stage(
             task_id,
-            vad_source_dir=source_dir,
+            vad_source_paths=[str(path) for path in source_paths],
             vad_total_sources=len(manifest),
             vad_total_audio_sec=total_audio_sec,
         )
@@ -253,14 +253,14 @@ def _run_audio_base_import_from_folder(
         progress_callback({"type": "task", "task": queued_task})
 
     try:
-        source_dir, manifest, total_audio_sec = _audio_base_service.stage_vad_sources_from_folder_path(
-            task_id,
+        source_paths, manifest, total_audio_sec = _audio_base_service.stage_vad_sources_from_folder_path(
+            normalized_base_name,
             folder_path,
             progress_callback=_on_preprocess_progress,
         )
         queued_task = _task_queue_service.activate_vad_stage(
             task_id,
-            vad_source_dir=source_dir,
+            vad_source_paths=[str(path) for path in source_paths],
             vad_total_sources=len(manifest),
             vad_total_audio_sec=total_audio_sec,
         )
@@ -603,6 +603,8 @@ def create_mix(payload: MixRequest) -> MixResponse:
             output_path=payload.output_path,
             speed_multiplier=payload.speed_multiplier,
             gap_ms=payload.gap_ms,
+            mix_mode=payload.mix_mode,
+            tail_extension_ms=payload.tail_extension_ms,
         )
         return MixResponse(
             job_id=result.job_id,

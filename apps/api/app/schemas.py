@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -35,6 +37,16 @@ class MixRequest(BaseModel):
     sentence: str = Field(..., min_length=1)
     speed_multiplier: float = Field(default=1.0, gt=0.0, description="Playback speed multiplier")
     gap_ms: int = Field(default=100, ge=0, description="Silence gap in milliseconds between words")
+    mix_mode: Literal["word", "word_phrase", "word_phrase_sentence"] = Field(
+        default="word_phrase_sentence",
+        description="Planning mode: word, word+phrase, or word+phrase+sentence",
+    )
+    tail_extension_ms: int = Field(
+        default=20,
+        ge=0,
+        le=500,
+        description="Random tail extension range (0..N ms) per clip, capped by source end.",
+    )
     output_path: str | None = None
 
 

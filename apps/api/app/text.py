@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import re
 
-WORD_RE = re.compile(r"[A-Za-z0-9']+")
-NORMALIZE_RE = re.compile(r"[^a-z0-9']+")
+WORD_RE = re.compile(r"[A-Za-z0-9']+|[\u3400-\u9fff]")
+NORMALIZE_RE = re.compile(r"[^a-z0-9\u3400-\u9fff']+")
 
 
 def tokenize_text(text: str) -> list[str]:

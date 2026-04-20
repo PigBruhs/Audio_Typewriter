@@ -41,6 +41,7 @@ class QueueTask:
     vad_total_audio_sec: float
     vad_processed_audio_sec: float
     vad_source_dir: str | None
+    vad_source_paths: list[str]
     vad_total_sources: int
     vad_next_source_index: int
     vad_next_segment_index: int
@@ -60,6 +61,8 @@ class QueueTask:
     asr_elapsed_sec: float = 0.0
     vad_running_since: str | None = None
     asr_running_since: str | None = None
+    asr_total_audio_sec: float = 0.0
+    asr_processed_audio_sec: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -75,6 +78,7 @@ class QueueTask:
             "vad_total_audio_sec": self.vad_total_audio_sec,
             "vad_processed_audio_sec": self.vad_processed_audio_sec,
             "vad_source_dir": self.vad_source_dir,
+            "vad_source_paths": list(self.vad_source_paths),
             "vad_total_sources": self.vad_total_sources,
             "vad_next_source_index": self.vad_next_source_index,
             "vad_next_segment_index": self.vad_next_segment_index,
@@ -93,6 +97,8 @@ class QueueTask:
             "asr_elapsed_sec": self.asr_elapsed_sec,
             "vad_running_since": self.vad_running_since,
             "asr_running_since": self.asr_running_since,
+            "asr_total_audio_sec": self.asr_total_audio_sec,
+            "asr_processed_audio_sec": self.asr_processed_audio_sec,
         }
 
     @staticmethod
@@ -110,6 +116,7 @@ class QueueTask:
             vad_total_audio_sec=float(payload.get("vad_total_audio_sec", 0.0)),
             vad_processed_audio_sec=float(payload.get("vad_processed_audio_sec", 0.0)),
             vad_source_dir=(str(payload["vad_source_dir"]) if payload.get("vad_source_dir") else None),
+            vad_source_paths=[str(item) for item in (payload.get("vad_source_paths") or []) if str(item)],
             vad_total_sources=int(payload.get("vad_total_sources", 0)),
             vad_next_source_index=int(payload.get("vad_next_source_index", 1)),
             vad_next_segment_index=int(payload.get("vad_next_segment_index", 0)),
@@ -129,6 +136,8 @@ class QueueTask:
             asr_elapsed_sec=float(payload.get("asr_elapsed_sec", 0.0)),
             vad_running_since=(str(payload["vad_running_since"]) if payload.get("vad_running_since") else None),
             asr_running_since=(str(payload["asr_running_since"]) if payload.get("asr_running_since") else None),
+            asr_total_audio_sec=float(payload.get("asr_total_audio_sec", 0.0)),
+            asr_processed_audio_sec=float(payload.get("asr_processed_audio_sec", 0.0)),
         )
 
 
@@ -291,6 +300,7 @@ class TaskQueueService:
         base_name: str,
         total_files: int,
         vad_source_dir: str,
+        vad_source_paths: list[str] | None = None,
         vad_total_sources: int,
         vad_total_audio_sec: float,
         task_id: str | None = None,
@@ -313,6 +323,7 @@ class TaskQueueService:
             vad_total_audio_sec=vad_total_audio_sec,
             vad_processed_audio_sec=0.0,
             vad_source_dir=vad_source_dir,
+            vad_source_paths=list(vad_source_paths or []),
             vad_total_sources=vad_total_sources,
             vad_next_source_index=1,
             vad_next_segment_index=0,
@@ -329,6 +340,8 @@ class TaskQueueService:
             asr_elapsed_sec=0.0,
             vad_running_since=now,
             asr_running_since=None,
+            asr_total_audio_sec=0.0,
+            asr_processed_audio_sec=0.0,
         )
         with self._condition:
             self._tasks.append(task)
@@ -360,6 +373,7 @@ class TaskQueueService:
             vad_total_audio_sec=0.0,
             vad_processed_audio_sec=0.0,
             vad_source_dir=None,
+            vad_source_paths=[],
             vad_total_sources=0,
             vad_next_source_index=1,
             vad_next_segment_index=0,
@@ -377,6 +391,8 @@ class TaskQueueService:
             asr_elapsed_sec=0.0,
             vad_running_since=None,
             asr_running_since=None,
+            asr_total_audio_sec=0.0,
+            asr_processed_audio_sec=0.0,
         )
         with self._condition:
             self._tasks.append(task)
@@ -411,7 +427,7 @@ class TaskQueueService:
         self,
         task_id: str,
         *,
-        vad_source_dir: str,
+        vad_source_paths: list[str],
         vad_total_sources: int,
         vad_total_audio_sec: float,
     ) -> dict[str, object]:
@@ -422,7 +438,8 @@ class TaskQueueService:
                 task.stage = _STAGE_VAD
                 task.status = _TASK_QUEUED
                 task.ready_for_asr = True
-                task.vad_source_dir = vad_source_dir
+                task.vad_source_dir = None
+                task.vad_source_paths = [str(path) for path in vad_source_paths]
                 task.vad_total_sources = max(0, int(vad_total_sources))
                 task.total_files = task.vad_total_sources
                 task.processed_files = 0
@@ -475,6 +492,7 @@ class TaskQueueService:
             vad_total_audio_sec=0.0,
             vad_processed_audio_sec=0.0,
             vad_source_dir=None,
+            vad_source_paths=[],
             vad_total_sources=0,
             vad_next_source_index=1,
             vad_next_segment_index=0,
@@ -489,6 +507,8 @@ class TaskQueueService:
             asr_elapsed_sec=0.0,
             vad_running_since=None,
             asr_running_since=None,
+            asr_total_audio_sec=0.0,
+            asr_processed_audio_sec=0.0,
         )
         with self._condition:
             self._tasks.append(task)
@@ -584,10 +604,14 @@ class TaskQueueService:
                 self._accumulate_stage_timer(task, _STAGE_VAD)
                 task.asr_elapsed_sec = 0.0
                 task.asr_running_since = None
+                all_records = self.database.list_audio_base_files(task.base_name, start_sequence_number=1)
+                task.asr_total_audio_sec = round(sum(max(0.0, row.duration_sec) for row in all_records), 3)
+                task.asr_processed_audio_sec = 0.0
                 if task.vad_total_audio_sec > 0:
                     task.vad_processed_audio_sec = task.vad_total_audio_sec
                 task.last_event = f"VAD total elapsed: {task.vad_elapsed_sec:.1f}s"
                 task.vad_source_dir = None
+                task.vad_source_paths = []
                 task.updated_at = self._now_iso()
                 self._save_tasks()
                 self._condition.notify_all()
@@ -722,29 +746,11 @@ class TaskQueueService:
                     self._save_tasks()
 
     def _run_vad_task(self, task: QueueTask) -> None:
-        if not task.vad_source_dir:
-            raise RuntimeError("VAD source directory is missing.")
-
-        source_dir = Path(task.vad_source_dir)
-        if not source_dir.exists():
-            raise RuntimeError("VAD source directory does not exist on disk.")
-
-        manifest = self.audio_base_service.load_vad_manifest(task.task_id)
-        if not manifest:
-            raise RuntimeError("VAD manifest is missing or empty.")
-
-        source_paths: list[Path] = []
-        for item in manifest:
-            file_name = str(item.get("file_name", ""))
-            if not file_name:
-                continue
-            source_path = source_dir / file_name
-            if not source_path.exists():
-                raise RuntimeError(f"VAD source file is missing: {source_path}")
-            source_paths.append(source_path)
+        source_paths = [Path(path) for path in task.vad_source_paths if str(path).strip()]
+        source_paths = [path for path in source_paths if path.exists()]
 
         if not source_paths:
-            raise RuntimeError("VAD manifest has no valid source files.")
+            raise RuntimeError("VAD has no valid source files.")
 
         self.checkpoint_vad(task.task_id)
         record = self.audio_base_service.export_sources_as_single_base_clip(
@@ -758,7 +764,7 @@ class TaskQueueService:
 
         with self._condition:
             task.vad_processed_audio_sec = max(task.vad_total_audio_sec, record.duration_sec)
-            task.vad_next_source_index = max(task.vad_total_sources, len(manifest)) + 1
+            task.vad_next_source_index = max(task.vad_total_sources, len(source_paths)) + 1
             task.vad_next_segment_index = len(speech_segments)
             task.vad_next_sequence_number = 2
             task.updated_at = self._now_iso()
@@ -796,10 +802,17 @@ class TaskQueueService:
             task.updated_at = self._now_iso()
             self._save_tasks()
         self.activate_asr_stage(task.task_id, total_files=len(records))
+        self.audio_base_service.clear_staged_sources(task.base_name)
         self.audio_base_service.clear_vad_job_storage(task.task_id)
 
     def _run_task(self, task: QueueTask) -> None:
         file_records = self.database.list_audio_base_files(task.base_name, task.next_sequence_number)
+        with self._condition:
+            if task.asr_total_audio_sec <= 0.0:
+                all_records = self.database.list_audio_base_files(task.base_name, start_sequence_number=1)
+                task.asr_total_audio_sec = round(sum(max(0.0, row.duration_sec) for row in all_records), 3)
+                self._save_tasks()
+
         for record in file_records:
             with self._condition:
                 if task.cancel_requested:
@@ -814,13 +827,32 @@ class TaskQueueService:
                     self._save_tasks()
                     return
 
+            with self._condition:
+                completed_before_record = max(0.0, float(task.asr_processed_audio_sec))
+                record_duration = max(0.0, float(record.duration_sec))
+
+            def _on_asr_progress(processed_audio_sec: float) -> None:
+                with self._condition:
+                    total_audio_sec = max(0.0, float(task.asr_total_audio_sec))
+                    current = completed_before_record + max(0.0, float(processed_audio_sec))
+                    if total_audio_sec > 0.0:
+                        current = min(current, total_audio_sec)
+                    task.asr_processed_audio_sec = max(float(task.asr_processed_audio_sec), round(current, 3))
+                    task.last_event = (
+                        f"ASR progress: {task.asr_processed_audio_sec:.1f}s/"
+                        f"{task.asr_total_audio_sec:.1f}s"
+                    )
+                    task.updated_at = self._now_iso()
+                    self._save_tasks()
+
             try:
                 source_record, occurrences, result = self.asr_service.ingest(
                     source_path=record.file_path,
                     source_audio_id=record.source_audio_id,
                     base_name=record.base_name,
-                    language="en",
+                    language=self.settings.asr_default_language,
                     model_tier=task.model_tier,
+                    progress_callback=_on_asr_progress,
                 )
             except ASRTranscriptionError as exc:
                 with self._condition:
@@ -847,6 +879,12 @@ class TaskQueueService:
                 task.token_count += int(result.token_count)
                 task.asr_last_completed_sequence = int(record.sequence_number)
                 task.next_sequence_number = record.sequence_number + 1
+                task.asr_processed_audio_sec = max(
+                    float(task.asr_processed_audio_sec),
+                    round(completed_before_record + record_duration, 3),
+                )
+                if task.asr_total_audio_sec > 0.0:
+                    task.asr_processed_audio_sec = min(task.asr_processed_audio_sec, task.asr_total_audio_sec)
                 task.updated_at = self._now_iso()
                 self._save_tasks()
 
@@ -867,7 +905,12 @@ class TaskQueueService:
                         "top_words": top_words,
                     },
                 )
+                removed_vad_files = self.audio_base_service.clear_vad_suffix_files(task.base_name)
                 task.last_event = f"ASR total elapsed: {task.asr_elapsed_sec:.1f}s (saved {metadata_path.name})"
+                if removed_vad_files > 0:
+                    task.last_event = f"{task.last_event}; removed {removed_vad_files} _vad files"
+                if task.asr_total_audio_sec > 0.0:
+                    task.asr_processed_audio_sec = task.asr_total_audio_sec
                 task.updated_at = self._now_iso()
                 self._save_tasks()
 
