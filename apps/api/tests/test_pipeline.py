@@ -241,7 +241,10 @@ class PipelineTests(unittest.TestCase):
 
         source_dir, manifest, total_sec = self.audio_base_service.stage_vad_sources_from_folder_path("task-local", str(local_root))
 
-        self.assertEqual(Path(source_dir), local_root)
+        staged_dir = Path(source_dir)
+        self.assertEqual(staged_dir, self.audio_base_service.vad_job_dir("task-local") / "sources")
+        self.assertTrue((staged_dir / "a.wav").exists())
+        self.assertTrue((staged_dir / "nested" / "b.mp3").exists())
         self.assertEqual(len(manifest), 2)
         self.assertEqual(manifest[0]["file_name"], "a.wav")
         self.assertEqual(manifest[1]["file_name"], "nested/b.mp3")

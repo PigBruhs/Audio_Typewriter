@@ -34,6 +34,9 @@ function formatBytes(bytes: number): string {
 }
 
 function formatStage(stage?: string): string {
+  if (stage === "preprocess") {
+    return "[PREP]";
+  }
   if (stage === "vad") {
     return "[VAD]";
   }
@@ -50,6 +53,23 @@ function clampProgress(current: number, total: number): { value: number; max: nu
 }
 
 function App(): JSX.Element {
+  const [language, setLanguage] = useState<"zh" | "en">("zh");
+  const isZh = language === "zh";
+  const tt = (zh: string, en: string): string => (isZh ? zh : en);
+  const mixTag = isZh ? "活字印刷" : "MIX";
+  const formatTaskStatus = (status: string): string => {
+    if (!isZh) {
+      return status;
+    }
+    if (status === "running") return "运行中";
+    if (status === "queued") return "排队中";
+    if (status === "paused") return "已暂停";
+    if (status === "completed") return "已完成";
+    if (status === "failed") return "失败";
+    if (status === "discarded") return "已丢弃";
+    return status;
+  };
+
   const [activeTab, setActiveTab] = useState<"workbench" | "tasks">("workbench");
   const [baseName, setBaseName] = useState("");
   const [sourceFolderPath, setSourceFolderPath] = useState("");
@@ -74,9 +94,9 @@ function App(): JSX.Element {
   const [reasrLoading, setReasrLoading] = useState(false);
   const [exiting, setExiting] = useState(false);
   const previousTasksRef = useRef<Record<string, QueueTask>>({});
-  const mixSpeedError = Number.isFinite(mixSpeed) && mixSpeed > 0 ? "" : "Speed must be greater than 0.";
-  const mixGapError = Number.isFinite(mixGapMs) && mixGapMs >= 0 ? "" : "Gap must be 0 or greater.";
-  const mixClipPaddingError = Number.isFinite(mixClipPaddingMs) && mixClipPaddingMs >= 0 ? "" : "Clip end padding must be 0 or greater.";
+  const mixSpeedError = Number.isFinite(mixSpeed) && mixSpeed > 0 ? "" : tt("速度必须大于 0。", "Speed must be greater than 0.");
+  const mixGapError = Number.isFinite(mixGapMs) && mixGapMs >= 0 ? "" : tt("间隔必须大于或等于 0。", "Gap must be 0 or greater.");
+  const mixClipPaddingError = Number.isFinite(mixClipPaddingMs) && mixClipPaddingMs >= 0 ? "" : tt("尾部补偿必须大于或等于 0。", "Clip end padding must be 0 or greater.");
   const hasMixInputError = Boolean(mixSpeedError || mixGapError || mixClipPaddingError);
 
   function appendImportLog(message: string): void {
@@ -92,10 +112,10 @@ function App(): JSX.Element {
   useEffect(() => {
     getHealth()
       .then((data) => setHealth(data))
-      .catch((error: unknown) => setResult(error instanceof Error ? error.message : "Load health failed"));
+      .catch((error: unknown) => setResult(error instanceof Error ? error.message : tt("加载运行状态失败", "Load health failed")));
 
     refreshBases().catch((error: unknown) => {
-      setResult(error instanceof Error ? error.message : "Load bases failed");
+      setResult(error instanceof Error ? error.message : tt("加载音频库失败", "Load bases failed"));
     });
 
     const timer = window.setInterval(() => {
@@ -126,7 +146,7 @@ function App(): JSX.Element {
     } catch (error) {
       if (allowMissingAsPending && error instanceof ApiError && error.status === 404) {
         setSelectedStats(null);
-        appendImportLog(`[SYSTEM] Base '${base}' is queued and not materialized yet. Continue processing...`);
+        appendImportLog(`[SYSTEM] ${tt(`音频库 '${base}' 已进入队列，尚未落盘，继续处理中...`, `Base '${base}' is queued and not materialized yet. Continue processing...`)}`);
         return;
       }
       throw error;
@@ -179,7 +199,7 @@ function App(): JSX.Element {
   async function onImportSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!baseName.trim() || !sourceFolderPath.trim()) {
-      setImportResult("Please enter base name and local folder path.");
+      setImportResult(tt("请输入音频库名称和本地文件夹路径。", "Please enter base name and local folder path."));
       return;
     }
 
@@ -201,6 +221,22 @@ function App(): JSX.Element {
             return next;
           });
           appendImportLog(`${formatStage(streamEvent.task.stage)} Task created: ${streamEvent.task.task_id}`);
+        }
+        if (streamEvent.type === "preprocess_start") {
+          setImportProgressCurrent(streamEvent.migrated_files);
+          setImportProgressTotal(streamEvent.total_files);
+          appendImportLog(`[PREP] start: ${streamEvent.migrated_files}/${streamEvent.total_files}`);
+        }
+        if (streamEvent.type === "preprocess_progress") {
+          setImportProgressCurrent(streamEvent.migrated_files);
+          setImportProgressTotal(streamEvent.total_files);
+          const fileLabel = streamEvent.file_name ? ` | ${streamEvent.file_name}` : "";
+          appendImportLog(`[PREP] ${streamEvent.migrated_files}/${streamEvent.total_files}${fileLabel}`);
+        }
+        if (streamEvent.type === "preprocess_complete") {
+          setImportProgressCurrent(streamEvent.migrated_files);
+          setImportProgressTotal(streamEvent.total_files);
+          appendImportLog("[PREP] completed.");
         }
         if (streamEvent.type === "vad_start") {
           setImportProgressCurrent(streamEvent.processed_audio_sec);
@@ -240,10 +276,16 @@ function App(): JSX.Element {
 
       const data = await importAudioBaseByPathStream(baseName.trim(), sourceFolderPath.trim(), onStreamEvent);
       const overwriteLabel = data.overwritten
-        ? `overwrite=yes(cleared files=${data.cleared_audio_files}, cleared indexed sources=${data.cleared_index_sources})`
-        : "overwrite=no";
+        ? tt(
+            `覆写=是(清理文件=${data.cleared_audio_files}, 清理索引源=${data.cleared_index_sources})`,
+            `overwrite=yes(cleared files=${data.cleared_audio_files}, cleared indexed sources=${data.cleared_index_sources})`
+          )
+        : tt("覆写=否", "overwrite=no");
       setImportResult(
-        `Imported base=${data.base_name}, ${overwriteLabel}, files=${data.audio_count}, duration=${data.total_duration_sec.toFixed(1)}s, size=${formatBytes(data.total_file_size_bytes)}, tokens=${data.token_count}`
+        tt(
+          `已导入音频库=${data.base_name}，${overwriteLabel}，文件数=${data.audio_count}，时长=${data.total_duration_sec.toFixed(1)}s，大小=${formatBytes(data.total_file_size_bytes)}，token=${data.token_count}`,
+          `Imported base=${data.base_name}, ${overwriteLabel}, files=${data.audio_count}, duration=${data.total_duration_sec.toFixed(1)}s, size=${formatBytes(data.total_file_size_bytes)}, tokens=${data.token_count}`
+        )
       );
       if (data.discarded_task_count && data.discarded_task_count > 0) {
         appendImportLog(`Overwrite discarded old unfinished tasks: ${data.discarded_task_count}`);
@@ -253,7 +295,7 @@ function App(): JSX.Element {
       setSelectedBase(data.base_name);
       await loadBaseStats(data.base_name, true);
     } catch (error) {
-      setImportResult(error instanceof Error ? error.message : "Import failed");
+      setImportResult(error instanceof Error ? error.message : tt("导入失败", "Import failed"));
     } finally {
       setImporting(false);
     }
@@ -264,7 +306,7 @@ function App(): JSX.Element {
       await pauseQueueTask(taskId);
       await refreshTasks();
     } catch (error) {
-      setResult(error instanceof Error ? error.message : "Pause task failed");
+      setResult(error instanceof Error ? error.message : tt("暂停任务失败", "Pause task failed"));
     }
   }
 
@@ -273,13 +315,16 @@ function App(): JSX.Element {
       await resumeQueueTask(taskId);
       await refreshTasks();
     } catch (error) {
-      setResult(error instanceof Error ? error.message : "Resume task failed");
+      setResult(error instanceof Error ? error.message : tt("继续任务失败", "Resume task failed"));
     }
   }
 
   async function onDeleteTask(taskId: string, baseName: string) {
     const confirmed = window.confirm(
-      `Delete task and purge related data for base '${baseName}'? This removes temp, DB index, and audio_base files.`
+      tt(
+        `确定删除任务并清理音频库 '${baseName}' 的相关数据吗？这会删除 temp、数据库索引和 audio_base 文件。`,
+        `Delete task and purge related data for base '${baseName}'? This removes temp, DB index, and audio_base files.`
+      )
     );
     if (!confirmed) {
       return;
@@ -290,7 +335,7 @@ function App(): JSX.Element {
       await refreshBases();
       appendImportLog(`[SYSTEM] Deleted task ${taskId} and purged base ${baseName}.`);
     } catch (error) {
-      setResult(error instanceof Error ? error.message : "Delete task failed");
+      setResult(error instanceof Error ? error.message : tt("删除任务失败", "Delete task failed"));
     }
   }
 
@@ -298,10 +343,10 @@ function App(): JSX.Element {
     setExiting(true);
     try {
       await requestSystemExit();
-      alert("Backend is shutting down and queue has been flushed. Close the frontend terminal if needed.");
+      alert(tt("后端正在安全退出，任务队列已保存。必要时请手动关闭前端终端。", "Backend is shutting down and queue has been flushed. Close the frontend terminal if needed."));
       window.close();
     } catch (error) {
-      setResult(error instanceof Error ? error.message : "Exit failed");
+      setResult(error instanceof Error ? error.message : tt("退出失败", "Exit failed"));
     } finally {
       setExiting(false);
     }
@@ -317,13 +362,13 @@ function App(): JSX.Element {
     try {
       await loadBaseStats(nextBase, true);
     } catch (error) {
-      setResult(error instanceof Error ? error.message : "Get base stats failed");
+      setResult(error instanceof Error ? error.message : tt("读取音频库统计失败", "Get base stats failed"));
     }
   }
 
   async function onReAsr(): Promise<void> {
     if (!selectedBase) {
-      setResult("Please select an audio base first.");
+      setResult(tt("请先选择一个音频库。", "Please select an audio base first."));
       return;
     }
     setReasrLoading(true);
@@ -337,9 +382,9 @@ function App(): JSX.Element {
       }
       await refreshTasks();
       await loadBaseStats(selectedBase, true);
-      setResult(`reASR queued for base=${data.base_name}, task=${data.task.task_id}`);
+      setResult(tt(`已提交 reASR：base=${data.base_name}, task=${data.task.task_id}`, `reASR queued for base=${data.base_name}, task=${data.task.task_id}`));
     } catch (error) {
-      const message = error instanceof Error ? error.message : "reASR failed";
+      const message = error instanceof Error ? error.message : tt("reASR 失败", "reASR failed");
       setResult(message);
       appendImportLog(`[ERROR] ${message}`);
     } finally {
@@ -350,25 +395,25 @@ function App(): JSX.Element {
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedBase) {
-      setResult("Please select an audio base first.");
+      setResult(tt("请先选择一个音频库。", "Please select an audio base first."));
       return;
     }
     if (hasMixInputError) {
       const message = [mixSpeedError, mixGapError, mixClipPaddingError].filter(Boolean).join(" ");
-      setResult(message || "Please fix mix input values.");
-      appendImportLog(`[MIX][ERROR] ${message || "Please fix mix input values."}`);
+      setResult(message || tt("请修正活字印刷参数。", "Please fix mix input values."));
+      appendImportLog(`[${mixTag}][ERROR] ${message || tt("请修正活字印刷参数。", "Please fix mix input values.")}`);
       return;
     }
     setLoading(true);
     setResult("");
     try {
       const data = await requestMix(selectedBase, sentence, mixMode, mixSpeed, mixGapMs, mixClipPaddingMs, clipTimingMode);
-      setResult(`base=${selectedBase}, job=${data.job_id}, status=${data.status}`);
-      appendImportLog(`[MIX] base=${selectedBase}, job=${data.job_id}, status=${data.status}`);
+      setResult(tt(`音频库=${selectedBase}, 任务=${data.job_id}, 状态=${data.status}`, `base=${selectedBase}, job=${data.job_id}, status=${data.status}`));
+      appendImportLog(`[${mixTag}] base=${selectedBase}, job=${data.job_id}, status=${data.status}`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error";
+      const message = error instanceof Error ? error.message : tt("未知错误", "Unknown error");
       setResult(message);
-      appendImportLog(`[MIX][ERROR] ${message}`);
+      appendImportLog(`[${mixTag}][ERROR] ${message}`);
     } finally {
       setLoading(false);
     }
@@ -376,47 +421,50 @@ function App(): JSX.Element {
 
   return (
     <main style={{ maxWidth: 680, margin: "40px auto", fontFamily: "sans-serif" }}>
-      <h1>Audio Typewriter</h1>
+      <h1>{tt("音频打字机", "Audio Typewriter")}</h1>
       <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-        <button type="button" onClick={() => setActiveTab("workbench")}>Workbench</button>
-        <button type="button" onClick={() => setActiveTab("tasks")}>Tasks</button>
+        <button type="button" onClick={() => setActiveTab("workbench")}>{tt("工作台", "Workbench")}</button>
+        <button type="button" onClick={() => setActiveTab("tasks")}>{tt("任务", "Tasks")}</button>
+        <button type="button" onClick={() => setLanguage((prev) => (prev === "zh" ? "en" : "zh"))}>
+          {isZh ? "English" : "中文"}
+        </button>
         <button type="button" onClick={onExit} disabled={exiting} style={{ marginLeft: "auto" }}>
-          {exiting ? "Exiting..." : "Exit"}
+          {exiting ? tt("退出中...", "Exiting...") : tt("退出", "Exit")}
         </button>
       </div>
-      <p>Import a folder as audio base, then build sentence-mixed clips from that base.</p>
+      <p>{tt("导入本地文件夹作为音频库，然后基于该音频库进行句子活字印刷。", "Import a folder as audio base, then build sentence-mixed clips from that base.")}</p>
       {health && (
         <p>
-          ASR runtime: <strong>{health.asr_resolved_device.toUpperCase()}</strong> ({health.asr_compute_type}) | preferred={health.asr_preferred_device} | last={health.asr_last_device_used}
+          {tt("ASR 运行时：", "ASR runtime:")} <strong>{health.asr_resolved_device.toUpperCase()}</strong> ({health.asr_compute_type}) | {tt("偏好", "preferred") }={health.asr_preferred_device} | {tt("最近", "last") }={health.asr_last_device_used}
         </p>
       )}
 
       {activeTab === "workbench" && (
       <>
       <section style={{ marginBottom: 24 }}>
-        <h2>Import Audio Base</h2>
+        <h2>{tt("导入音频库", "Import Audio Base")}</h2>
         <form onSubmit={onImportSubmit}>
           <input
             value={baseName}
             onChange={(event) => setBaseName(event.target.value)}
-            placeholder="base name, e.g. speaker_a"
+            placeholder={tt("音频库名称，例如 speaker_a", "base name, e.g. speaker_a")}
             style={{ width: "100%", marginBottom: 8 }}
           />
           <input
             value={sourceFolderPath}
             onChange={(event) => setSourceFolderPath(event.target.value)}
-            placeholder="local folder path, e.g. E:\\Recordings\\Henry"
+            placeholder={tt("本地文件夹路径，例如 E:\\Recordings\\Henry", "local folder path, e.g. E:\\Recordings\\Henry")}
             style={{ width: "100%", marginBottom: 8 }}
           />
-          <div style={{ marginBottom: 8 }}>Backend will scan .wav/.mp3 from this local folder path.</div>
+          <div style={{ marginBottom: 8 }}>{tt("后端会从该本地路径扫描 .wav/.mp3 文件。", "Backend will scan .wav/.mp3 from this local folder path.")}</div>
           <button type="submit" disabled={importing || !baseName.trim() || !sourceFolderPath.trim()}>
-            {importing ? "Importing and indexing..." : "Import Base"}
+            {importing ? tt("导入并索引中...", "Importing and indexing...") : tt("导入音频库", "Import Base")}
           </button>
         </form>
         {importing && importProgressTotal > 0 && (
           <div style={{ marginTop: 8 }}>
             <div style={{ marginBottom: 4 }}>
-              Progress: {importProgressCurrent}/{importProgressTotal}
+              {tt("进度", "Progress")}: {importProgressCurrent}/{importProgressTotal}
             </div>
             <progress value={importProgressCurrent} max={importProgressTotal} style={{ width: "100%" }} />
           </div>
@@ -425,10 +473,10 @@ function App(): JSX.Element {
       </section>
 
       <section style={{ marginBottom: 24 }}>
-        <h2>Active Audio Base</h2>
+        <h2>{tt("当前音频库", "Active Audio Base")}</h2>
         <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
           <select value={selectedBase} onChange={onBaseChange} style={{ flex: 1 }}>
-            <option value="">Select a base...</option>
+            <option value="">{tt("选择音频库...", "Select a base...")}</option>
             {bases.map((base) => (
               <option key={base.base_name} value={base.base_name}>
                 {base.base_name}
@@ -441,39 +489,39 @@ function App(): JSX.Element {
         </div>
         {selectedStats && (
           <div>
-            <div>Audio count: {selectedStats.audio_count}</div>
-            <div>Total duration: {selectedStats.total_duration_sec.toFixed(1)} s</div>
-            <div>Total file size: {formatBytes(selectedStats.total_file_size_bytes)}</div>
+            <div>{tt("音频数量", "Audio count")}: {selectedStats.audio_count}</div>
+            <div>{tt("总时长", "Total duration")}: {selectedStats.total_duration_sec.toFixed(1)} s</div>
+            <div>{tt("总文件大小", "Total file size")}: {formatBytes(selectedStats.total_file_size_bytes)}</div>
           </div>
         )}
       </section>
 
-      <h2>Create Mix</h2>
+      <h2>{tt("创建活字印刷", "Create Mix")}</h2>
       <form onSubmit={onSubmit}>
         <select value={mixMode} onChange={(event) => setMixMode(event.target.value)} style={{ width: "100%", marginBottom: 8 }}>
-          <option value="context_priority">Context Priority (same/adjacent clip first)</option>
-          <option value="all_random">All Random</option>
-          <option value="nearest_gap">Nearest Gap Priority</option>
-          <option value="farthest_gap">Farthest Gap Priority</option>
+          <option value="context_priority">{tt("语境优先（同段/相邻段优先）", "Context Priority (same/adjacent clip first)")}</option>
+          <option value="all_random">{tt("完全随机", "All Random")}</option>
+          <option value="nearest_gap">{tt("间隔最近优先", "Nearest Gap Priority")}</option>
+          <option value="farthest_gap">{tt("间隔最远优先", "Farthest Gap Priority")}</option>
         </select>
         <select
           value={clipTimingMode}
           onChange={(event) => setClipTimingMode(event.target.value as "whisper_raw" | "experimental_next_word_start")}
           style={{ width: "100%", marginBottom: 8 }}
         >
-          <option value="whisper_raw">Timing: Whisper Raw (start -&gt; end)</option>
-          <option value="experimental_next_word_start">Timing: Experimental (start -&gt; next physical word start)</option>
+          <option value="whisper_raw">{tt("时间策略：Whisper 原始（start -&gt; end）", "Timing: Whisper Raw (start -&gt; end)")}</option>
+          <option value="experimental_next_word_start">{tt("时间策略：实验（start -&gt; 物理下一个词 start）", "Timing: Experimental (start -&gt; next physical word start)")}</option>
         </select>
         <textarea
           rows={4}
           value={sentence}
           onChange={(event) => setSentence(event.target.value)}
           style={{ width: "100%" }}
-          placeholder="Type sentence here..."
+          placeholder={tt("在这里输入目标句子...", "Type sentence here...")}
         />
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 8, marginBottom: 8 }}>
           <label>
-            Speed (x)
+            {tt("变速 (x)", "Speed (x)")}
             <input
               type="number"
               min={0.1}
@@ -485,7 +533,7 @@ function App(): JSX.Element {
             {mixSpeedError && <div style={{ color: "crimson", fontSize: 12 }}>{mixSpeedError}</div>}
           </label>
           <label>
-            Gap (ms)
+            {tt("间隔 (ms)", "Gap (ms)")}
             <input
               type="number"
               min={0}
@@ -497,7 +545,7 @@ function App(): JSX.Element {
             {mixGapError && <div style={{ color: "crimson", fontSize: 12 }}>{mixGapError}</div>}
           </label>
           <label>
-            End Padding (ms)
+            {tt("尾部补偿 (ms)", "End Padding (ms)")}
             <input
               type="number"
               min={0}
@@ -510,7 +558,7 @@ function App(): JSX.Element {
           </label>
         </div>
         <button type="submit" disabled={loading || !selectedBase || sentence.trim().length === 0 || hasMixInputError}>
-          {loading ? "Submitting..." : "Create Mix Job"}
+          {loading ? tt("提交中...", "Submitting...") : tt("创建活字印刷任务", "Create Mix Job")}
         </button>
       </form>
       {result && <pre>{result}</pre>}
@@ -519,18 +567,18 @@ function App(): JSX.Element {
 
       {activeTab === "tasks" && (
         <section>
-          <h2>Task Queue</h2>
-          <p>One indexing task runs at a time.</p>
-          {tasks.length === 0 && <div>No tasks yet.</div>}
+          <h2>{tt("任务队列", "Task Queue")}</h2>
+          <p>{tt("索引任务为串行执行，一次只运行一个。", "One indexing task runs at a time.")}</p>
+          {tasks.length === 0 && <div>{tt("暂无任务。", "No tasks yet.")}</div>}
           {tasks.map((task) => (
             <div key={task.task_id} style={{ border: "1px solid #ccc", padding: 8, marginBottom: 8 }}>
-              <div><strong>{task.base_name}</strong> [{task.status}] {formatStage(task.stage)}</div>
+              <div><strong>{task.base_name}</strong> [{formatTaskStatus(task.status)}] {formatStage(task.stage)}</div>
               {task.stage === "vad" ? (
                 <>
                   <div>
-                    VAD Progress: {(task.vad_processed_audio_sec ?? 0).toFixed(1)}s/{(task.vad_total_audio_sec ?? 0).toFixed(1)}s
+                    {tt("VAD 进度", "VAD Progress")}: {(task.vad_processed_audio_sec ?? 0).toFixed(1)}s/{(task.vad_total_audio_sec ?? 0).toFixed(1)}s
                   </div>
-                  <div>VAD Elapsed: {(task.vad_elapsed_sec ?? 0).toFixed(1)}s</div>
+                  <div>{tt("VAD 用时", "VAD Elapsed")}: {(task.vad_elapsed_sec ?? 0).toFixed(1)}s</div>
                   <progress
                     {...clampProgress(task.vad_processed_audio_sec ?? 0, task.vad_total_audio_sec ?? 0)}
                     style={{ width: "100%", marginTop: 4 }}
@@ -538,23 +586,23 @@ function App(): JSX.Element {
                 </>
               ) : (
                 <>
-                  <div>ASR Progress: {task.processed_files}/{task.total_files}, next={task.next_sequence_number}</div>
-                  <div>ASR Elapsed: {(task.asr_elapsed_sec ?? 0).toFixed(1)}s</div>
+                  <div>{tt("ASR 进度", "ASR Progress")}: {task.processed_files}/{task.total_files}, next={task.next_sequence_number}</div>
+                  <div>{tt("ASR 用时", "ASR Elapsed")}: {(task.asr_elapsed_sec ?? 0).toFixed(1)}s</div>
                   <progress
                     {...clampProgress(task.processed_files, task.total_files)}
                     style={{ width: "100%", marginTop: 4 }}
                   />
                 </>
               )}
-              {task.last_error && <div style={{ color: "crimson" }}>Error: {task.last_error}</div>}
+              {task.last_error && <div style={{ color: "crimson" }}>{tt("错误", "Error")}: {task.last_error}</div>}
               {task.status === "running" && (
-                <button type="button" onClick={() => onPauseTask(task.task_id)}>Pause</button>
+                <button type="button" onClick={() => onPauseTask(task.task_id)}>{tt("暂停", "Pause")}</button>
               )}
               {(task.status === "paused" || task.status === "failed" || task.status === "queued") && (
-                <button type="button" onClick={() => onResumeTask(task.task_id)}>Resume</button>
+                <button type="button" onClick={() => onResumeTask(task.task_id)}>{tt("继续", "Resume")}</button>
               )}
               <button type="button" onClick={() => onDeleteTask(task.task_id, task.base_name)} style={{ marginLeft: 8 }}>
-                Delete
+                {tt("删除", "Delete")}
               </button>
             </div>
           ))}
@@ -562,12 +610,12 @@ function App(): JSX.Element {
       )}
 
       <section style={{ marginTop: 20 }}>
-        <h2>Console</h2>
+        <h2>{tt("控制台", "Console")}</h2>
         <div style={{ fontSize: 13, color: "#666", marginBottom: 6 }}>
-          Runtime logs from import/VAD/ASR pipeline.
+          {tt("显示导入 / VAD / ASR 流程运行日志。", "Runtime logs from import/VAD/ASR pipeline.")}
         </div>
         <pre style={{ maxHeight: 220, overflow: "auto", background: "#111", color: "#ddd", padding: 10 }}>
-          {importLogs.length > 0 ? importLogs.join("\n") : "[SYSTEM] No logs yet."}
+          {importLogs.length > 0 ? importLogs.join("\n") : tt("[SYSTEM] 暂无日志。", "[SYSTEM] No logs yet.")}
         </pre>
       </section>
     </main>

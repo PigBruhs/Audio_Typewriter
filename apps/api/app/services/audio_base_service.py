@@ -450,7 +450,12 @@ class AudioBaseService:
             )
         return normalized_path
 
-    def stage_vad_sources(self, task_id: str, files: list[UploadFile]) -> tuple[str, list[dict[str, object]], float]:
+    def stage_vad_sources(
+        self,
+        task_id: str,
+        files: list[UploadFile],
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
+    ) -> tuple[str, list[dict[str, object]], float]:
         filtered = [file for file in files if Path(file.filename or "").suffix.lower() in _ALLOWED_EXTENSIONS]
         if not filtered:
             raise ValueError("No .wav or .mp3 files were provided.")
@@ -462,6 +467,15 @@ class AudioBaseService:
 
         manifest: list[dict[str, object]] = []
         total_audio_sec = 0.0
+        total_files = len(filtered)
+        if progress_callback:
+            progress_callback(
+                {
+                    "type": "preprocess_start",
+                    "total_files": total_files,
+                    "migrated_files": 0,
+                }
+            )
         for index, upload in enumerate(filtered, start=1):
             suffix = Path(upload.filename or "").suffix.lower() or ".wav"
             saved_name = f"{index:06d}{suffix}"
@@ -478,11 +492,33 @@ class AudioBaseService:
                     "duration_sec": duration_sec,
                 }
             )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "type": "preprocess_progress",
+                        "total_files": total_files,
+                        "migrated_files": index,
+                        "file_name": saved_name,
+                    }
+                )
 
         (job_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        if progress_callback:
+            progress_callback(
+                {
+                    "type": "preprocess_complete",
+                    "total_files": total_files,
+                    "migrated_files": total_files,
+                }
+            )
         return str(source_dir), manifest, round(total_audio_sec, 3)
 
-    def stage_vad_sources_from_folder_path(self, task_id: str, folder_path: str) -> tuple[str, list[dict[str, object]], float]:
+    def stage_vad_sources_from_folder_path(
+        self,
+        task_id: str,
+        folder_path: str,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
+    ) -> tuple[str, list[dict[str, object]], float]:
         root_dir = Path(folder_path).expanduser()
         if not root_dir.exists() or not root_dir.is_dir():
             raise ValueError(f"Folder was not found or is not a directory: {folder_path}")
@@ -493,13 +529,28 @@ class AudioBaseService:
 
         all_files.sort(key=lambda item: item.relative_to(root_dir).as_posix().lower())
         job_dir = self.vad_job_dir(task_id)
-        job_dir.mkdir(parents=True, exist_ok=True)
+        source_dir = job_dir / "sources"
+        source_dir.mkdir(parents=True, exist_ok=True)
+
+        total_files = len(all_files)
+        if progress_callback:
+            progress_callback(
+                {
+                    "type": "preprocess_start",
+                    "total_files": total_files,
+                    "migrated_files": 0,
+                }
+            )
 
         manifest: list[dict[str, object]] = []
         total_audio_sec = 0.0
         for index, source_path in enumerate(all_files, start=1):
             relative_name = source_path.relative_to(root_dir).as_posix()
-            duration_sec = self._probe_duration(source_path)
+            staged_path = source_dir / relative_name
+            staged_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, staged_path)
+
+            duration_sec = self._probe_duration(staged_path)
             total_audio_sec += duration_sec
             manifest.append(
                 {
@@ -508,9 +559,26 @@ class AudioBaseService:
                     "duration_sec": duration_sec,
                 }
             )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "type": "preprocess_progress",
+                        "total_files": total_files,
+                        "migrated_files": index,
+                        "file_name": source_path.name,
+                    }
+                )
 
         (job_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        return str(root_dir), manifest, round(total_audio_sec, 3)
+        if progress_callback:
+            progress_callback(
+                {
+                    "type": "preprocess_complete",
+                    "total_files": total_files,
+                    "migrated_files": total_files,
+                }
+            )
+        return str(source_dir), manifest, round(total_audio_sec, 3)
 
     def load_vad_manifest(self, task_id: str) -> list[dict[str, object]]:
         manifest_path = self.vad_job_dir(task_id) / "manifest.json"

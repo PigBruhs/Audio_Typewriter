@@ -81,6 +81,9 @@ export type ImportStreamEvent =
   | { type: "status"; message: string }
   | { type: "task"; task: QueueTask }
   | { type: "overwrite"; base_name: string; cleared_audio_files: number; cleared_index_sources: number }
+  | { type: "preprocess_start"; total_files: number; migrated_files: number }
+  | { type: "preprocess_progress"; total_files: number; migrated_files: number; file_name?: string }
+  | { type: "preprocess_complete"; total_files: number; migrated_files: number }
   | { type: "vad_start"; base_name: string; total_audio_sec: number; processed_audio_sec: number }
   | { type: "vad_progress"; base_name: string; file_name: string; total_audio_sec: number; processed_audio_sec: number }
   | { type: "vad_complete"; base_name: string; total_audio_sec: number; processed_audio_sec: number }

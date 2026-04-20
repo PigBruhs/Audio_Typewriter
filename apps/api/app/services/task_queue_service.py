@@ -22,6 +22,7 @@ _TASK_COMPLETED = "completed"
 _TASK_FAILED = "failed"
 _TASK_DISCARDED = "discarded"
 
+_STAGE_PREPROCESS = "preprocess"
 _STAGE_VAD = "vad"
 _STAGE_ASR = "asr"
 
@@ -335,6 +336,123 @@ class TaskQueueService:
             self._condition.notify_all()
         return task.to_dict()
 
+    def create_preprocess_task(
+        self,
+        *,
+        base_name: str,
+        task_id: str,
+        model_tier: str = "large",
+        overwritten: bool = False,
+        cleared_audio_files: int = 0,
+        cleared_index_sources: int = 0,
+    ) -> dict[str, object]:
+        now = self._now_iso()
+        task = QueueTask(
+            task_id=task_id,
+            base_name=base_name,
+            status=_TASK_RUNNING,
+            total_files=0,
+            processed_files=0,
+            next_sequence_number=1,
+            token_count=0,
+            stage=_STAGE_PREPROCESS,
+            ready_for_asr=False,
+            vad_total_audio_sec=0.0,
+            vad_processed_audio_sec=0.0,
+            vad_source_dir=None,
+            vad_total_sources=0,
+            vad_next_source_index=1,
+            vad_next_segment_index=0,
+            vad_next_sequence_number=1,
+            vad_created_at=now,
+            asr_last_completed_sequence=0,
+            model_tier=model_tier,
+            created_at=now,
+            updated_at=now,
+            overwritten=overwritten,
+            cleared_audio_files=cleared_audio_files,
+            cleared_index_sources=cleared_index_sources,
+            last_event="Preprocess started.",
+            vad_elapsed_sec=0.0,
+            asr_elapsed_sec=0.0,
+            vad_running_since=None,
+            asr_running_since=None,
+        )
+        with self._condition:
+            self._tasks.append(task)
+            self._save_tasks()
+            self._condition.notify_all()
+        return task.to_dict()
+
+    def update_preprocess_progress(
+        self,
+        task_id: str,
+        *,
+        migrated_files: int,
+        total_files: int,
+        message: str,
+    ) -> dict[str, object]:
+        with self._condition:
+            for task in self._tasks:
+                if task.task_id != task_id:
+                    continue
+                if task.stage != _STAGE_PREPROCESS:
+                    return task.to_dict()
+                task.processed_files = max(0, int(migrated_files))
+                task.total_files = max(task.processed_files, int(total_files))
+                task.vad_total_sources = task.total_files
+                task.last_event = message
+                task.updated_at = self._now_iso()
+                self._save_tasks()
+                return task.to_dict()
+        raise ValueError(f"Task not found: {task_id}")
+
+    def activate_vad_stage(
+        self,
+        task_id: str,
+        *,
+        vad_source_dir: str,
+        vad_total_sources: int,
+        vad_total_audio_sec: float,
+    ) -> dict[str, object]:
+        with self._condition:
+            for task in self._tasks:
+                if task.task_id != task_id:
+                    continue
+                task.stage = _STAGE_VAD
+                task.status = _TASK_QUEUED
+                task.ready_for_asr = True
+                task.vad_source_dir = vad_source_dir
+                task.vad_total_sources = max(0, int(vad_total_sources))
+                task.total_files = task.vad_total_sources
+                task.processed_files = 0
+                task.vad_total_audio_sec = max(0.0, float(vad_total_audio_sec))
+                task.vad_processed_audio_sec = 0.0
+                task.vad_next_source_index = 1
+                task.vad_next_segment_index = 0
+                task.vad_next_sequence_number = 1
+                task.last_error = None
+                task.last_event = "Preprocess completed. VAD queued."
+                task.updated_at = self._now_iso()
+                self._save_tasks()
+                self._condition.notify_all()
+                return task.to_dict()
+        raise ValueError(f"Task not found: {task_id}")
+
+    def fail_preprocess_task(self, task_id: str, detail: str) -> dict[str, object]:
+        with self._condition:
+            for task in self._tasks:
+                if task.task_id != task_id:
+                    continue
+                task.status = _TASK_FAILED
+                task.last_error = detail
+                task.last_event = f"Preprocess failed: {detail}"
+                task.updated_at = self._now_iso()
+                self._save_tasks()
+                self._condition.notify_all()
+                return task.to_dict()
+        raise ValueError(f"Task not found: {task_id}")
+
     def enqueue_reasr_task(
         self,
         *,
@@ -405,9 +523,10 @@ class TaskQueueService:
                     return task.to_dict()
                 if task.status == _TASK_RUNNING:
                     return task.to_dict()
-                if task.stage == _STAGE_VAD:
+                if task.stage in {_STAGE_PREPROCESS, _STAGE_VAD}:
                     task.status = _TASK_RUNNING
-                    self._start_stage_timer(task, _STAGE_VAD)
+                    if task.stage == _STAGE_VAD:
+                        self._start_stage_timer(task, _STAGE_VAD)
                 else:
                     self._rewind_asr_checkpoint_for_resume(task)
                     self.database.purge_asr_index_from_sequence(task.base_name, task.next_sequence_number)
@@ -745,6 +864,7 @@ class TaskQueueService:
             task.updated_at = self._now_iso()
             self._save_tasks()
         self.activate_asr_stage(task.task_id, total_files=len(records))
+        self.audio_base_service.clear_vad_job_storage(task.task_id)
 
     def _run_task(self, task: QueueTask) -> None:
         file_records = self.database.list_audio_base_files(task.base_name, task.next_sequence_number)

@@ -89,22 +89,52 @@ def _run_audio_base_import(
             )
 
     task_id = str(uuid.uuid4())
-    source_dir, manifest, total_audio_sec = _audio_base_service.stage_vad_sources(task_id, files)
-
-    queued_task = _task_queue_service.enqueue_import_task(
+    queued_task = _task_queue_service.create_preprocess_task(
         base_name=normalized_base_name,
-        total_files=0,
-        vad_source_dir=source_dir,
-        vad_total_sources=len(manifest),
-        vad_total_audio_sec=total_audio_sec,
+        task_id=task_id,
         model_tier="large",
         overwritten=overwritten,
         cleared_audio_files=cleared_audio_files,
         cleared_index_sources=cleared_index_sources,
-        task_id=task_id,
     )
     if progress_callback:
         progress_callback({"type": "task", "task": queued_task})
+
+    def _on_preprocess_progress(payload: dict[str, object]) -> None:
+        total_files = int(payload.get("total_files", 0) or 0)
+        migrated_files = int(payload.get("migrated_files", 0) or 0)
+        file_name = str(payload.get("file_name", "") or "")
+        message = f"Preprocess: {migrated_files}/{max(total_files, migrated_files)}"
+        if file_name:
+            message = f"{message} ({file_name})"
+        try:
+            _task_queue_service.update_preprocess_progress(
+                task_id,
+                migrated_files=migrated_files,
+                total_files=max(total_files, migrated_files),
+                message=message,
+            )
+        except ValueError:
+            pass
+        if progress_callback:
+            progress_callback(payload)
+            progress_callback({"type": "status", "message": message})
+
+    try:
+        source_dir, manifest, total_audio_sec = _audio_base_service.stage_vad_sources(
+            task_id,
+            files,
+            progress_callback=_on_preprocess_progress,
+        )
+        queued_task = _task_queue_service.activate_vad_stage(
+            task_id,
+            vad_source_dir=source_dir,
+            vad_total_sources=len(manifest),
+            vad_total_audio_sec=total_audio_sec,
+        )
+    except Exception as exc:
+        _task_queue_service.fail_preprocess_task(task_id, str(exc))
+        raise
 
     def _forward_progress(payload: dict[str, object]) -> None:
         event_type = str(payload.get("type", ""))
@@ -190,19 +220,53 @@ def _run_audio_base_import_from_folder(
             )
 
     task_id = str(uuid.uuid4())
-    source_dir, manifest, total_audio_sec = _audio_base_service.stage_vad_sources_from_folder_path(task_id, folder_path)
-    queued_task = _task_queue_service.enqueue_import_task(
+    queued_task = _task_queue_service.create_preprocess_task(
         base_name=normalized_base_name,
-        total_files=0,
-        vad_source_dir=source_dir,
-        vad_total_sources=len(manifest),
-        vad_total_audio_sec=total_audio_sec,
+        task_id=task_id,
         model_tier="large",
         overwritten=overwritten,
         cleared_audio_files=cleared_audio_files,
         cleared_index_sources=cleared_index_sources,
-        task_id=task_id,
     )
+
+    def _on_preprocess_progress(payload: dict[str, object]) -> None:
+        total_files = int(payload.get("total_files", 0) or 0)
+        migrated_files = int(payload.get("migrated_files", 0) or 0)
+        file_name = str(payload.get("file_name", "") or "")
+        message = f"Preprocess: {migrated_files}/{max(total_files, migrated_files)}"
+        if file_name:
+            message = f"{message} ({file_name})"
+        try:
+            _task_queue_service.update_preprocess_progress(
+                task_id,
+                migrated_files=migrated_files,
+                total_files=max(total_files, migrated_files),
+                message=message,
+            )
+        except ValueError:
+            pass
+        if progress_callback:
+            progress_callback(payload)
+            progress_callback({"type": "status", "message": message})
+
+    if progress_callback:
+        progress_callback({"type": "task", "task": queued_task})
+
+    try:
+        source_dir, manifest, total_audio_sec = _audio_base_service.stage_vad_sources_from_folder_path(
+            task_id,
+            folder_path,
+            progress_callback=_on_preprocess_progress,
+        )
+        queued_task = _task_queue_service.activate_vad_stage(
+            task_id,
+            vad_source_dir=source_dir,
+            vad_total_sources=len(manifest),
+            vad_total_audio_sec=total_audio_sec,
+        )
+    except Exception as exc:
+        _task_queue_service.fail_preprocess_task(task_id, str(exc))
+        raise
 
     stats = _database.get_audio_base_stats(normalized_base_name) or _audio_base_service.summarize_records(
         normalized_base_name,
