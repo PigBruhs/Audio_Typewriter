@@ -381,6 +381,38 @@ class AudioBaseService:
             self._concat_full_clips(source_paths, target_path)
         return target_path
 
+    def export_sources_as_single_base_clip(
+        self,
+        *,
+        base_name: str,
+        source_paths: list[Path],
+        created_at: str,
+    ) -> AudioBaseFileRecord:
+        if not source_paths:
+            raise ValueError("source_paths must not be empty.")
+
+        target_dir = self.base_path(base_name)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_name = "base.wav"
+        target_path = target_dir / target_name
+
+        if len(source_paths) == 1:
+            self._transcode_full_clip(source_paths[0], target_path)
+        else:
+            # Use PCM-safe concat path to avoid speed drift or duplicated frames.
+            self._concat_full_clips(source_paths, target_path)
+
+        return AudioBaseFileRecord(
+            source_audio_id=base_name,
+            base_name=base_name,
+            sequence_number=1,
+            file_name=target_name,
+            file_path=str(target_path),
+            duration_sec=self._probe_duration(target_path),
+            file_size_bytes=target_path.stat().st_size,
+            created_at=created_at,
+        )
+
     def append_sources_to_existing_clip(
         self,
         *,

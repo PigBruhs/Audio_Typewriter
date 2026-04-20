@@ -5,7 +5,15 @@ from pathlib import Path
 from typing import Iterable
 
 from .core.config import settings
-from .models import AudioBaseFileRecord, AudioBaseRecord, AudioBaseStats, AudioSourceRecord, MixJobRecord, WordOccurrenceRecord
+from .models import (
+    AudioBaseFileRecord,
+    AudioBaseRecord,
+    AudioBaseStats,
+    AudioSourceRecord,
+    MixJobRecord,
+    PhraseOccurrenceRecord,
+    WordOccurrenceRecord,
+)
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -380,10 +388,10 @@ class SQLiteDatabase:
             total_file_size_bytes=int(row["total_file_size_bytes"]),
         )
 
-    def search_token(self, normalized_token: str, limit: int = 8, base_name: str | None = None) -> list[WordOccurrenceRecord]:
+    def search_token(self, normalized_token: str, limit: int | None = 8, base_name: str | None = None) -> list[WordOccurrenceRecord]:
         connection = self.connect()
         try:
-            if base_name:
+            if base_name and limit is not None:
                 rows = connection.execute(
                     """
                     SELECT wo.id, wo.source_audio_id, wo.token, wo.normalized_token, wo.start_sec, wo.end_sec,
@@ -396,7 +404,19 @@ class SQLiteDatabase:
                     """,
                     (normalized_token, base_name, limit),
                 ).fetchall()
-            else:
+            elif base_name:
+                rows = connection.execute(
+                    """
+                    SELECT wo.id, wo.source_audio_id, wo.token, wo.normalized_token, wo.start_sec, wo.end_sec,
+                           wo.confidence, wo.segment_index, wo.word_index
+                    FROM word_occurrences wo
+                    JOIN audio_sources src ON src.source_audio_id = wo.source_audio_id
+                    WHERE wo.normalized_token = ? AND src.base_name = ?
+                    ORDER BY wo.confidence DESC, wo.start_sec ASC, wo.id ASC
+                    """,
+                    (normalized_token, base_name),
+                ).fetchall()
+            elif limit is not None:
                 rows = connection.execute(
                     """
                     SELECT id, source_audio_id, token, normalized_token, start_sec, end_sec,
@@ -407,6 +427,17 @@ class SQLiteDatabase:
                     LIMIT ?
                     """,
                     (normalized_token, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT id, source_audio_id, token, normalized_token, start_sec, end_sec,
+                           confidence, segment_index, word_index
+                    FROM word_occurrences
+                    WHERE normalized_token = ?
+                    ORDER BY confidence DESC, start_sec ASC, id ASC
+                    """,
+                    (normalized_token,),
                 ).fetchall()
         finally:
             connection.close()
@@ -421,6 +452,79 @@ class SQLiteDatabase:
                 confidence=float(row["confidence"]),
                 segment_index=int(row["segment_index"]),
                 word_index=int(row["word_index"]),
+            )
+            for row in rows
+        ]
+
+    def search_phrase_tokens(
+        self,
+        normalized_tokens: list[str],
+        *,
+        base_name: str | None = None,
+        limit: int | None = 8,
+    ) -> list[PhraseOccurrenceRecord]:
+        tokens = [str(token).strip() for token in normalized_tokens if str(token).strip()]
+        if len(tokens) < 2:
+            return []
+
+        aliases = [f"w{idx}" for idx in range(len(tokens))]
+        joins: list[str] = []
+        for idx in range(1, len(tokens)):
+            joins.append(
+                f"JOIN word_occurrences {aliases[idx]} ON "
+                f"{aliases[idx]}.source_audio_id = w0.source_audio_id AND "
+                f"{aliases[idx]}.segment_index = w0.segment_index AND "
+                f"{aliases[idx]}.word_index = w0.word_index + {idx}"
+            )
+
+        confidence_expr = " + ".join(f"{alias}.confidence" for alias in aliases)
+        confidence_expr = f"(({confidence_expr}) / {len(aliases)})"
+        phrase_text_expr = " || ' ' || ".join(f"{alias}.token" for alias in aliases)
+        where_clause = " AND ".join(f"{alias}.normalized_token = ?" for alias in aliases)
+
+        sql = (
+            "SELECT "
+            "w0.source_audio_id AS source_audio_id, "
+            f"{phrase_text_expr} AS phrase_text, "
+            "w0.start_sec AS start_sec, "
+            f"{aliases[-1]}.end_sec AS end_sec, "
+            f"{confidence_expr} AS confidence, "
+            "w0.segment_index AS segment_index, "
+            "w0.word_index AS start_word_index, "
+            f"{aliases[-1]}.word_index AS end_word_index "
+            "FROM word_occurrences w0 "
+            f"{' '.join(joins)} "
+        )
+
+        params: list[object] = [*tokens]
+        if base_name:
+            sql += "JOIN audio_sources src ON src.source_audio_id = w0.source_audio_id "
+            where_clause += " AND src.base_name = ?"
+            params.append(base_name)
+
+        sql += f"WHERE {where_clause} ORDER BY confidence DESC, start_sec ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+
+        connection = self.connect()
+        try:
+            rows = connection.execute(sql, params).fetchall()
+        finally:
+            connection.close()
+
+        normalized_phrase = " ".join(tokens)
+        return [
+            PhraseOccurrenceRecord(
+                source_audio_id=str(row["source_audio_id"]),
+                phrase_text=str(row["phrase_text"]),
+                normalized_phrase=normalized_phrase,
+                start_sec=float(row["start_sec"]),
+                end_sec=float(row["end_sec"]),
+                confidence=float(row["confidence"]),
+                segment_index=int(row["segment_index"]),
+                start_word_index=int(row["start_word_index"]),
+                end_word_index=int(row["end_word_index"]),
             )
             for row in rows
         ]
@@ -480,22 +584,6 @@ class SQLiteDatabase:
             return None
         return str(row["source_path"])
 
-    def get_next_word_start(self, source_audio_id: str, current_start_sec: float) -> float | None:
-        connection = self.connect()
-        try:
-            row = connection.execute(
-                """
-                SELECT MIN(start_sec) AS next_start
-                FROM word_occurrences
-                WHERE source_audio_id = ? AND start_sec > ?
-                """,
-                (source_audio_id, float(current_start_sec) + 1e-6),
-            ).fetchone()
-        finally:
-            connection.close()
-        if row is None or row["next_start"] is None:
-            return None
-        return float(row["next_start"])
 
     def get_base_index_summary(self, base_name: str) -> dict[str, int]:
         connection = self.connect()

@@ -601,11 +601,8 @@ def create_mix(payload: MixRequest) -> MixResponse:
             payload.sentence,
             base_name=payload.base_name,
             output_path=payload.output_path,
-            mix_mode=payload.mix_mode,
             speed_multiplier=payload.speed_multiplier,
             gap_ms=payload.gap_ms,
-            clip_end_padding_ms=payload.clip_end_padding_ms,
-            clip_timing_mode=payload.clip_timing_mode,
         )
         return MixResponse(
             job_id=result.job_id,

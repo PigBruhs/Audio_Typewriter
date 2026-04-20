@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 import threading
 from typing import Callable
-import wave
 
 from ..core.config import Settings, settings
 from ..models import AudioSourceRecord, IngestResult, WordOccurrenceRecord
@@ -21,13 +19,10 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     ctranslate2 = None  # type: ignore[assignment]
 
-
-@dataclass(slots=True)
-class TranscriptionOutput:
-    source_audio_id: str
-    device_used: str
-    compute_type: str
-    occurrences: list[WordOccurrenceRecord]
+try:
+    import whisperx  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    whisperx = None  # type: ignore[assignment]
 
 
 @dataclass(slots=True)
@@ -46,8 +41,6 @@ class ASRTranscriptionError(RuntimeError):
 
 
 class ASRService:
-    _MIN_WORD_DURATION_SEC = 0.001
-
     def __init__(
         self,
         runtime_settings: Settings | None = None,
@@ -59,6 +52,8 @@ class ASRService:
         self.last_compute_type = self.settings.asr_cpu_compute_type
         self._model_cache: dict[tuple[str, str, str], object] = {}
         self._model_cache_lock = threading.RLock()
+        self._align_model_cache: dict[tuple[str, str], tuple[object, object]] = {}
+        self._align_model_cache_lock = threading.RLock()
         self.last_runtime_events: list[str] = []
 
     def consume_runtime_events(self) -> list[str]:
@@ -118,37 +113,18 @@ class ASRService:
             self._model_cache[key] = model
             return model
 
-    def _probe_wav_duration_sec(self, source_path: str) -> float | None:
-        path = Path(source_path)
-        if path.suffix.lower() != ".wav":
-            return None
-        try:
-            with wave.open(str(path), "rb") as wav_file:
-                framerate = wav_file.getframerate()
-                if framerate <= 0:
-                    return None
-                return float(wav_file.getnframes()) / float(framerate)
-        except Exception:
-            return None
-
-    def _resolve_clip_runtime(self, source_path: str, device: str, compute_type: str) -> tuple[str, str]:
-        if device != "cuda":
-            return device, compute_type
-        clip_duration = self._probe_wav_duration_sec(source_path)
-        if clip_duration is None:
-            return device, compute_type
-        threshold = max(0.0, float(getattr(self.settings, "asr_cuda_short_audio_cpu_threshold_sec", 0.8)))
-        if 0.0 < clip_duration <= threshold:
-            return "cpu", self.settings.asr_cpu_compute_type
-        return device, compute_type
-
-    def _should_use_internal_vad(self, source_path: str) -> bool:
-        try:
-            source = Path(source_path).resolve()
-            audio_base_root = self.settings.audio_base_dir.resolve()
-            return audio_base_root not in source.parents
-        except Exception:
-            return True
+    def _get_or_create_align_model(self, language: str, device: str) -> tuple[object, object]:
+        if whisperx is None:
+            raise RuntimeError("whisperx is not installed")
+        language_code = (language or "en").lower()
+        key = (language_code, device)
+        with self._align_model_cache_lock:
+            cached = self._align_model_cache.get(key)
+            if cached is not None:
+                return cached
+            align_model, metadata = whisperx.load_align_model(language_code=language_code, device=device)
+            self._align_model_cache[key] = (align_model, metadata)
+            return align_model, metadata
 
     def download_model(
         self,
@@ -190,17 +166,15 @@ class ASRService:
         model: object,
         source_path: str,
         language: str,
-        *,
-        vad_filter: bool,
-    ) -> list[WordOccurrenceRecord]:
+    ) -> tuple[list[WordOccurrenceRecord], list[dict[str, object]]]:
         segments, _info = model.transcribe(  # type: ignore[attr-defined]
             source_path,
             language=language,
             beam_size=self.settings.asr_beam_size,
             word_timestamps=True,
-            vad_filter=vad_filter,
         )
         occurrences: list[WordOccurrenceRecord] = []
+        align_segments: list[dict[str, object]] = []
 
         def _to_float(value: object, default: float) -> float:
             try:
@@ -213,6 +187,10 @@ class ASRService:
             if not words:
                 continue
 
+            segment_start = _to_float(getattr(segment, "start", 0.0), 0.0)
+            segment_end = max(segment_start, _to_float(getattr(segment, "end", segment_start), segment_start))
+            segment_text = str(getattr(segment, "text", "") or "").strip()
+
             raw_words: list[tuple[str, str, float, float, float, int]] = []
             for word_index, word in enumerate(words):
                 token_text = getattr(word, "word", "").strip()
@@ -220,12 +198,22 @@ class ASRService:
                 if not normalized_token:
                     continue
                 start_sec = max(0.0, _to_float(getattr(word, "start", 0.0), 0.0))
-                end_sec = max(start_sec + self._MIN_WORD_DURATION_SEC, _to_float(getattr(word, "end", start_sec), start_sec))
+                end_sec = max(start_sec, _to_float(getattr(word, "end", start_sec), start_sec))
                 confidence = _to_float(getattr(word, "probability", 0.0), 0.0)
                 raw_words.append((token_text, normalized_token, start_sec, end_sec, confidence, word_index))
 
             if not raw_words:
                 continue
+
+            if not segment_text:
+                segment_text = " ".join(token_text for token_text, *_rest in raw_words)
+            align_segments.append(
+                {
+                    "start": segment_start,
+                    "end": segment_end,
+                    "text": segment_text,
+                }
+            )
 
             for token_text, normalized_token, start_sec, end_sec, confidence, original_word_index in raw_words:
                 occurrences.append(
@@ -241,7 +229,112 @@ class ASRService:
                         word_index=original_word_index,
                     )
                 )
-        return occurrences
+        return occurrences, align_segments
+
+    def _extract_aligned_words(self, aligned_payload: dict[str, object]) -> list[tuple[str, float, float, float]]:
+        aligned_words: list[tuple[str, float, float, float]] = []
+
+        def _to_float(value: object, default: float) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        word_segments = aligned_payload.get("word_segments")
+        if isinstance(word_segments, list):
+            for item in word_segments:
+                if not isinstance(item, dict):
+                    continue
+                token_text = str(item.get("word", "") or "").strip()
+                if not normalize_word(token_text):
+                    continue
+                start_sec = max(0.0, _to_float(item.get("start", 0.0), 0.0))
+                end_sec = max(start_sec, _to_float(item.get("end", start_sec), start_sec))
+                score = _to_float(item.get("score", 0.0), 0.0)
+                aligned_words.append((token_text, start_sec, end_sec, score))
+            if aligned_words:
+                return aligned_words
+
+        segments = aligned_payload.get("segments")
+        if not isinstance(segments, list):
+            return aligned_words
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            words = segment.get("words")
+            if not isinstance(words, list):
+                continue
+            for word in words:
+                if not isinstance(word, dict):
+                    continue
+                token_text = str(word.get("word", "") or "").strip()
+                if not normalize_word(token_text):
+                    continue
+                start_sec = max(0.0, _to_float(word.get("start", 0.0), 0.0))
+                end_sec = max(start_sec, _to_float(word.get("end", start_sec), start_sec))
+                score = _to_float(word.get("score", 0.0), 0.0)
+                aligned_words.append((token_text, start_sec, end_sec, score))
+        return aligned_words
+
+    def _apply_forced_alignment(
+        self,
+        *,
+        source_path: str,
+        language: str,
+        occurrences: list[WordOccurrenceRecord],
+        segments: list[dict[str, object]],
+        runtime_events: list[str],
+    ) -> list[WordOccurrenceRecord]:
+        if not occurrences or not segments:
+            return occurrences
+        if whisperx is None:
+            runtime_events.append("Forced alignment skipped: whisperx is not installed.")
+            return occurrences
+
+        device, _compute = self.resolve_runtime()
+        align_device = "cuda" if device == "cuda" else "cpu"
+
+        try:
+            align_model, align_metadata = self._get_or_create_align_model(language, align_device)
+            audio = whisperx.load_audio(source_path)
+            aligned_payload = whisperx.align(
+                segments,
+                align_model,
+                align_metadata,
+                audio,
+                align_device,
+                return_char_alignments=False,
+            )
+            aligned_words = self._extract_aligned_words(aligned_payload)
+            if len(aligned_words) != len(occurrences):
+                runtime_events.append(
+                    f"Forced alignment returned {len(aligned_words)} words but ASR has {len(occurrences)} words; keep ASR timestamps."
+                )
+                return occurrences
+
+            refined: list[WordOccurrenceRecord] = []
+            for original, aligned in zip(occurrences, aligned_words):
+                token_text, start_sec, end_sec, score = aligned
+                refined.append(
+                    WordOccurrenceRecord(
+                        id=None,
+                        source_audio_id=original.source_audio_id,
+                        token=original.token or token_text,
+                        normalized_token=original.normalized_token,
+                        start_sec=start_sec,
+                        end_sec=end_sec,
+                        confidence=max(0.0, score) if score > 0 else original.confidence,
+                        segment_index=original.segment_index,
+                        word_index=original.word_index,
+                    )
+                )
+            runtime_events.append(f"Forced alignment applied for {source_path}.")
+            return refined
+        except Exception as exc:
+            runtime_events.append(
+                f"Forced alignment failed for {source_path}: {type(exc).__name__}: {exc}. Keep ASR timestamps."
+            )
+            return occurrences
 
     def transcribe(
         self,
@@ -251,19 +344,20 @@ class ASRService:
         model_name: str | None = None,
     ) -> list[WordOccurrenceRecord]:
         resolved_name = self.settings.resolve_model_name(model_tier, language, model_name=model_name)
-        preferred_device, preferred_compute_type = self.resolve_runtime()
-        device, compute_type = self._resolve_clip_runtime(source_path, preferred_device, preferred_compute_type)
-        vad_filter = self._should_use_internal_vad(source_path)
+        device, compute_type = self.resolve_runtime()
         runtime_events: list[str] = []
-        if preferred_device == "cuda" and device == "cpu":
-            runtime_events.append(
-                f"Short clip detected for {source_path}; use CPU ({compute_type}) to avoid CUDA instability."
-            )
 
         occurrences: list[WordOccurrenceRecord] = []
         try:
             model = self._get_or_create_model(resolved_name, device, compute_type)
-            occurrences = self._transcribe_with_model(model, source_path, language, vad_filter=vad_filter)
+            occurrences, align_segments = self._transcribe_with_model(model, source_path, language)
+            occurrences = self._apply_forced_alignment(
+                source_path=source_path,
+                language=language,
+                occurrences=occurrences,
+                segments=align_segments,
+                runtime_events=runtime_events,
+            )
         except Exception as primary_exc:
             if device == "cuda":
                 runtime_events.append(
@@ -273,7 +367,14 @@ class ASRService:
                 compute_type = self.settings.asr_cpu_compute_type
                 try:
                     model = self._get_or_create_model(resolved_name, device, compute_type)
-                    occurrences = self._transcribe_with_model(model, source_path, language, vad_filter=vad_filter)
+                    occurrences, align_segments = self._transcribe_with_model(model, source_path, language)
+                    occurrences = self._apply_forced_alignment(
+                        source_path=source_path,
+                        language=language,
+                        occurrences=occurrences,
+                        segments=align_segments,
+                        runtime_events=runtime_events,
+                    )
                     runtime_events.append(f"CPU fallback succeeded for {source_path}.")
                 except Exception as cpu_exc:
                     detail = (

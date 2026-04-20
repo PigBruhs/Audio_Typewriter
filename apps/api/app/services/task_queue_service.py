@@ -733,115 +733,38 @@ class TaskQueueService:
         if not manifest:
             raise RuntimeError("VAD manifest is missing or empty.")
 
-        min_clip_sec = max(0.0, float(getattr(self.settings, "vad_min_clip_sec", 20.0)))
-        buffered_segments: list[tuple[Path, float, float]] = []
-        buffered_audio_sec = 0.0
-        next_source_cursor = task.vad_next_source_index
-        next_segment_cursor = task.vad_next_segment_index
-
+        source_paths: list[Path] = []
         for item in manifest:
-            index = int(item.get("index", 0))
-            if index < task.vad_next_source_index:
-                continue
-
-            with self._condition:
-                if task.cancel_requested:
-                    self._accumulate_stage_timer(task, _STAGE_VAD)
-                    task.status = _TASK_DISCARDED
-                    task.updated_at = self._now_iso()
-                    self._save_tasks()
-                    return
-                if task.status == _TASK_PAUSED:
-                    self._accumulate_stage_timer(task, _STAGE_VAD)
-                    task.updated_at = self._now_iso()
-                    self._save_tasks()
-                    return
-
             file_name = str(item.get("file_name", ""))
+            if not file_name:
+                continue
             source_path = source_dir / file_name
             if not source_path.exists():
                 raise RuntimeError(f"VAD source file is missing: {source_path}")
+            source_paths.append(source_path)
 
-            speech_segments = self.audio_base_service.detect_source_speech_segments(source_path)
-            segment_start_index = task.vad_next_segment_index if index == task.vad_next_source_index else 0
-            if segment_start_index >= len(speech_segments):
-                with self._condition:
-                    task.vad_next_source_index = index + 1
-                    task.vad_next_segment_index = 0
-                    task.updated_at = self._now_iso()
-                    self._save_tasks()
-                continue
+        if not source_paths:
+            raise RuntimeError("VAD manifest has no valid source files.")
 
-            for segment_index in range(segment_start_index, len(speech_segments)):
-                start_sec, end_sec = speech_segments[segment_index]
-                segment_duration = max(0.0, float(end_sec) - float(start_sec))
-                if segment_duration <= 0.0:
-                    continue
+        self.checkpoint_vad(task.task_id)
+        record = self.audio_base_service.export_sources_as_single_base_clip(
+            base_name=task.base_name,
+            source_paths=source_paths,
+            created_at=task.vad_created_at or task.created_at,
+        )
 
-                buffered_segments.append((source_path, float(start_sec), float(end_sec)))
-                buffered_audio_sec += segment_duration
+        speech_segments = self.audio_base_service.detect_source_speech_segments(Path(record.file_path))
+        speech_total_sec = round(sum(max(0.0, end - start) for start, end in speech_segments), 3)
 
-                if segment_index + 1 < len(speech_segments):
-                    next_source_cursor = index
-                    next_segment_cursor = segment_index + 1
-                else:
-                    next_source_cursor = index + 1
-                    next_segment_cursor = 0
+        with self._condition:
+            task.vad_processed_audio_sec = max(task.vad_total_audio_sec, record.duration_sec)
+            task.vad_next_source_index = max(task.vad_total_sources, len(manifest)) + 1
+            task.vad_next_segment_index = len(speech_segments)
+            task.vad_next_sequence_number = 2
+            task.updated_at = self._now_iso()
+            self._save_tasks()
 
-                if min_clip_sec > 0.0 and buffered_audio_sec < min_clip_sec:
-                    continue
-
-                self.checkpoint_vad(task.task_id)
-                self.audio_base_service.export_vad_segments_as_clip(
-                    base_name=task.base_name,
-                    sequence_number=task.vad_next_sequence_number,
-                    segment_specs=buffered_segments,
-                )
-
-                with self._condition:
-                    task.vad_processed_audio_sec = min(
-                        task.vad_total_audio_sec,
-                        round(task.vad_processed_audio_sec + buffered_audio_sec, 3),
-                    )
-                    task.vad_next_source_index = next_source_cursor
-                    task.vad_next_segment_index = next_segment_cursor
-                    task.vad_next_sequence_number += 1
-                    task.updated_at = self._now_iso()
-                    self._save_tasks()
-
-                buffered_segments = []
-                buffered_audio_sec = 0.0
-
-        if buffered_segments:
-            self.checkpoint_vad(task.task_id)
-            if task.vad_next_sequence_number > 1:
-                last_sequence = task.vad_next_sequence_number - 1
-                self.audio_base_service.append_vad_segments_to_existing_clip(
-                    base_name=task.base_name,
-                    sequence_number=last_sequence,
-                    segment_specs=buffered_segments,
-                )
-            else:
-                # If nothing exists yet, keep one short clip instead of dropping data.
-                self.audio_base_service.export_vad_segments_as_clip(
-                    base_name=task.base_name,
-                    sequence_number=task.vad_next_sequence_number,
-                    segment_specs=buffered_segments,
-                )
-                with self._condition:
-                    task.vad_next_sequence_number += 1
-
-            with self._condition:
-                task.vad_processed_audio_sec = min(
-                    task.vad_total_audio_sec,
-                    round(task.vad_processed_audio_sec + buffered_audio_sec, 3),
-                )
-                task.vad_next_source_index = next_source_cursor
-                task.vad_next_segment_index = next_segment_cursor
-                task.updated_at = self._now_iso()
-                self._save_tasks()
-
-        records = self.audio_base_service.collect_base_records(task.base_name, task.vad_created_at or task.created_at)
+        records = [record]
         base_record = AudioBaseRecord(
             base_name=task.base_name,
             base_path=str(self.audio_base_service.base_path(task.base_name)),
@@ -856,6 +779,15 @@ class TaskQueueService:
                 "base_path": str(self.audio_base_service.base_path(task.base_name)),
                 "audio_count": len(records),
                 "vad_total_elapsed_sec": round(task.vad_elapsed_sec, 3),
+                "vad_speech_segment_count": len(speech_segments),
+                "vad_speech_total_sec": speech_total_sec,
+                "vad_speech_segments": [
+                    {
+                        "start_sec": round(float(start), 3),
+                        "end_sec": round(float(end), 3),
+                    }
+                    for start, end in speech_segments[:2000]
+                ],
                 "vad_completed_at": self._now_iso(),
             },
         )

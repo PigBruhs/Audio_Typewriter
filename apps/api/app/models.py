@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 
 
 @dataclass(slots=True)
@@ -28,6 +27,19 @@ class WordOccurrenceRecord:
     confidence: float
     segment_index: int
     word_index: int
+
+
+@dataclass(slots=True)
+class PhraseOccurrenceRecord:
+    source_audio_id: str
+    phrase_text: str
+    normalized_phrase: str
+    start_sec: float
+    end_sec: float
+    confidence: float
+    segment_index: int
+    start_word_index: int
+    end_word_index: int
 
 
 @dataclass(slots=True)

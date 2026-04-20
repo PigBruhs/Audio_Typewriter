@@ -118,7 +118,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["device"], "cpu")
 
-    def test_transcribe_routes_very_short_cuda_clip_to_cpu(self) -> None:
+    def test_transcribe_prefers_cuda_when_available(self) -> None:
         settings = Settings(
             data_dir=self.settings.data_dir,
             database_path=self.settings.database_path,
@@ -150,13 +150,12 @@ class PipelineTests(unittest.TestCase):
 
         service = ASRService(settings, model_factory=fake_factory)
         service._cuda_available = lambda: True  # type: ignore[method-assign]
-        service._probe_wav_duration_sec = lambda _path: 0.6  # type: ignore[method-assign]
 
         service.transcribe("audio_base/demo_base/000001.wav", language="en", model_tier="large")
 
         self.assertTrue(calls)
-        self.assertEqual(calls[0]["device"], "cpu")
-        self.assertEqual(service.last_device_used, "cpu")
+        self.assertEqual(calls[0]["device"], "cuda")
+        self.assertEqual(service.last_device_used, "cuda")
 
     def test_transcribe_keeps_whisper_word_boundaries(self) -> None:
         class DummyWord:
@@ -350,7 +349,8 @@ class PipelineTests(unittest.TestCase):
 
         plan = self.mixing_service.build_mix_plan("hello world", base_name="demo_base")
         self.assertEqual(plan.missing_tokens, [])
-        self.assertEqual(len(plan.items), 2)
+        self.assertEqual(len(plan.items), 1)
+        self.assertEqual(plan.items[0].token, "hello world")
 
     def test_mix_sentence_reports_missing_tokens(self) -> None:
         audio_source = AudioSourceRecord(
@@ -400,12 +400,10 @@ class PipelineTests(unittest.TestCase):
 
             command = run_mock.call_args.args[0]
             filter_graph = command[command.index("-filter_complex") + 1]
-            self.assertIn("atrim=start=0.000:end=0.200", filter_graph)
-            self.assertIn("atrim=start=0.300:end=0.500", filter_graph)
-            self.assertIn("anullsrc", filter_graph)
-            self.assertIn("concat=n=3:v=0:a=1[rawout]", filter_graph)
+            self.assertIn("atrim=start=0.000:end=0.500", filter_graph)
+            self.assertNotIn("anullsrc", filter_graph)
 
-    def test_mix_sentence_experimental_mode_clips_to_next_physical_word_start(self) -> None:
+    def test_mix_sentence_uses_whisper_word_end_timestamp(self) -> None:
         source = AudioSourceRecord(
             source_audio_id="demo_base:000011",
             base_name="demo_base",
@@ -429,15 +427,11 @@ class PipelineTests(unittest.TestCase):
             run_mock.return_value.returncode = 0
             run_mock.return_value.stdout = ""
             run_mock.return_value.stderr = ""
-            self.mixing_service.mix_sentence(
-                "i",
-                base_name="demo_base",
-                clip_timing_mode="experimental_next_word_start",
-            )
+            self.mixing_service.mix_sentence("i", base_name="demo_base")
 
             command = run_mock.call_args.args[0]
             filter_graph = command[command.index("-filter_complex") + 1]
-            self.assertIn("atrim=start=0.000:end=0.300", filter_graph)
+            self.assertIn("atrim=start=0.000:end=0.100", filter_graph)
 
     def test_mix_sentence_applies_speed_multiplier(self) -> None:
         source = AudioSourceRecord(
@@ -469,7 +463,7 @@ class PipelineTests(unittest.TestCase):
             filter_graph = command[command.index("-filter_complex") + 1]
             self.assertIn("atempo=1.500000", filter_graph)
 
-    def test_context_priority_prefers_same_source_segment(self) -> None:
+    def test_mix_plan_first_word_uses_highest_confidence(self) -> None:
         source_a = AudioSourceRecord(
             source_audio_id="demo_base:000001",
             base_name="demo_base",
@@ -492,94 +486,15 @@ class PipelineTests(unittest.TestCase):
             created_at="2026-01-01T00:00:00+00:00",
             updated_at="2026-01-01T00:00:00+00:00",
         )
-        self.index_service.ingest(source_a, [WordOccurrenceRecord(None, "demo_base:000001", "hello", "hello", 0.0, 0.2, 0.95, 0, 0)])
-        self.index_service.ingest(
-            source_b,
-            [
-                WordOccurrenceRecord(None, "demo_base:000002", "world", "world", 0.2, 0.4, 0.99, 1, 0),
-                WordOccurrenceRecord(None, "demo_base:000001", "world", "world", 0.3, 0.5, 0.20, 0, 1),
-            ],
-        )
+        self.index_service.ingest(source_a, [WordOccurrenceRecord(None, "demo_base:000001", "hello", "hello", 0.0, 0.2, 0.70, 0, 0)])
+        self.index_service.ingest(source_b, [WordOccurrenceRecord(None, "demo_base:000002", "hello", "hello", 0.1, 0.3, 0.95, 0, 0)])
 
-        plan = self.mixing_service.build_mix_plan(
-            "hello world",
-            base_name="demo_base",
-            mix_mode="context_priority",
-        )
-        self.assertEqual(len(plan.items), 2)
-        self.assertEqual(plan.items[1].source_audio_id, "demo_base:000001")
+        plan = self.mixing_service.build_mix_plan("hello", base_name="demo_base", job_id="job-first-conf")
+        self.assertEqual(len(plan.items), 1)
+        self.assertEqual(plan.items[0].source_audio_id, "demo_base:000002")
 
-    def test_context_priority_treats_adjacent_audio_as_same_sentence(self) -> None:
-        source_center = AudioSourceRecord(
-            source_audio_id="demo_base:000005",
-            base_name="demo_base",
-            source_path="audio_base/demo_base/000005.wav",
-            language="en",
-            model_tier="base",
-            device="cpu",
-            compute_type="int8",
-            created_at="2026-01-01T00:00:00+00:00",
-            updated_at="2026-01-01T00:00:00+00:00",
-        )
-        source_adjacent = AudioSourceRecord(
-            source_audio_id="demo_base:000006",
-            base_name="demo_base",
-            source_path="audio_base/demo_base/000006.wav",
-            language="en",
-            model_tier="base",
-            device="cpu",
-            compute_type="int8",
-            created_at="2026-01-01T00:00:00+00:00",
-            updated_at="2026-01-01T00:00:00+00:00",
-        )
-        source_far = AudioSourceRecord(
-            source_audio_id="demo_base:000010",
-            base_name="demo_base",
-            source_path="audio_base/demo_base/000010.wav",
-            language="en",
-            model_tier="base",
-            device="cpu",
-            compute_type="int8",
-            created_at="2026-01-01T00:00:00+00:00",
-            updated_at="2026-01-01T00:00:00+00:00",
-        )
-        self.index_service.ingest(source_center, [WordOccurrenceRecord(None, "demo_base:000005", "hello", "hello", 0.1, 0.2, 0.99, 0, 0)])
-        self.index_service.ingest(
-            source_adjacent,
-            [WordOccurrenceRecord(None, "demo_base:000006", "world", "world", 0.2, 0.3, 0.98, 0, 0)],
-        )
-        self.index_service.ingest(
-            source_far,
-            [WordOccurrenceRecord(None, "demo_base:000010", "world", "world", 0.2, 0.3, 0.97, 0, 0)],
-        )
-
-        plan = self.mixing_service.build_mix_plan("hello world", base_name="demo_base", mix_mode="context_priority")
-        self.assertEqual(plan.items[1].source_audio_id, "demo_base:000006")
-
-    def test_gap_modes_rank_by_audio_gap_then_time_components(self) -> None:
-        source_005 = AudioSourceRecord(
-            source_audio_id="demo_base:000005",
-            base_name="demo_base",
-            source_path="audio_base/demo_base/000005.wav",
-            language="en",
-            model_tier="base",
-            device="cpu",
-            compute_type="int8",
-            created_at="2026-01-01T00:00:00+00:00",
-            updated_at="2026-01-01T00:00:00+00:00",
-        )
-        source_004 = AudioSourceRecord(
-            source_audio_id="demo_base:000004",
-            base_name="demo_base",
-            source_path="audio_base/demo_base/000004.wav",
-            language="en",
-            model_tier="base",
-            device="cpu",
-            compute_type="int8",
-            created_at="2026-01-01T00:00:00+00:00",
-            updated_at="2026-01-01T00:00:00+00:00",
-        )
-        source_001 = AudioSourceRecord(
+    def test_mix_plan_prefers_same_source_nearest_timestamp_after_first_word(self) -> None:
+        source_a = AudioSourceRecord(
             source_audio_id="demo_base:000001",
             base_name="demo_base",
             source_path="audio_base/demo_base/000001.wav",
@@ -590,10 +505,10 @@ class PipelineTests(unittest.TestCase):
             created_at="2026-01-01T00:00:00+00:00",
             updated_at="2026-01-01T00:00:00+00:00",
         )
-        source_007 = AudioSourceRecord(
-            source_audio_id="demo_base:000007",
+        source_b = AudioSourceRecord(
+            source_audio_id="demo_base:000002",
             base_name="demo_base",
-            source_path="audio_base/demo_base/000007.wav",
+            source_path="audio_base/demo_base/000002.wav",
             language="en",
             model_tier="base",
             device="cpu",
@@ -601,20 +516,63 @@ class PipelineTests(unittest.TestCase):
             created_at="2026-01-01T00:00:00+00:00",
             updated_at="2026-01-01T00:00:00+00:00",
         )
+        self.index_service.ingest(source_a, [WordOccurrenceRecord(None, "demo_base:000001", "hello", "hello", 1.0, 1.2, 0.95, 0, 0)])
+        self.index_service.ingest(
+            source_b,
+            [
+                WordOccurrenceRecord(None, "demo_base:000002", "world", "world", 1.1, 1.4, 0.99, 1, 0),
+                WordOccurrenceRecord(None, "demo_base:000001", "world", "world", 0.2, 0.4, 0.90, 0, 1),
+                WordOccurrenceRecord(None, "demo_base:000001", "world", "world", 0.95, 1.15, 0.10, 0, 2),
+            ],
+        )
 
-        self.index_service.ingest(source_005, [WordOccurrenceRecord(None, "demo_base:000005", "hello", "hello", 365.0, 365.3, 0.99, 0, 0)])
-        self.index_service.ingest(source_004, [WordOccurrenceRecord(None, "demo_base:000004", "world", "world", 360.0, 360.2, 0.90, 0, 0)])
-        self.index_service.ingest(source_001, [WordOccurrenceRecord(None, "demo_base:000001", "world", "world", 241.0, 241.2, 0.90, 0, 1)])
-        self.index_service.ingest(source_007, [WordOccurrenceRecord(None, "demo_base:000007", "world", "world", 10.0, 10.2, 0.90, 0, 2)])
+        plan = self.mixing_service.build_mix_plan("hello world", base_name="demo_base", job_id="job-1")
+        self.assertEqual(len(plan.items), 1)
+        self.assertEqual(plan.items[0].source_audio_id, "demo_base:000001")
+        self.assertAlmostEqual(plan.items[0].start_sec, 1.0, places=3)
 
-        nearest = self.mixing_service.build_mix_plan("hello world", base_name="demo_base", mix_mode="nearest_gap")
-        farthest = self.mixing_service.build_mix_plan("hello world", base_name="demo_base", mix_mode="farthest_gap")
-        self.assertEqual(nearest.items[1].source_audio_id, "demo_base:000004")
-        self.assertEqual(farthest.items[1].source_audio_id, "demo_base:000001")
+    def test_mix_plan_falls_back_to_global_highest_confidence_when_same_source_missing(self) -> None:
+        source_a = AudioSourceRecord(
+            source_audio_id="demo_base:000001",
+            base_name="demo_base",
+            source_path="audio_base/demo_base/000001.wav",
+            language="en",
+            model_tier="base",
+            device="cpu",
+            compute_type="int8",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        source_b = AudioSourceRecord(
+            source_audio_id="demo_base:000002",
+            base_name="demo_base",
+            source_path="audio_base/demo_base/000002.wav",
+            language="en",
+            model_tier="base",
+            device="cpu",
+            compute_type="int8",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        source_c = AudioSourceRecord(
+            source_audio_id="demo_base:000003",
+            base_name="demo_base",
+            source_path="audio_base/demo_base/000003.wav",
+            language="en",
+            model_tier="base",
+            device="cpu",
+            compute_type="int8",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        self.index_service.ingest(source_a, [WordOccurrenceRecord(None, "demo_base:000001", "hello", "hello", 0.0, 0.2, 0.95, 0, 0)])
+        self.index_service.ingest(source_b, [WordOccurrenceRecord(None, "demo_base:000002", "world", "world", 0.2, 0.4, 0.99, 0, 0)])
+        self.index_service.ingest(source_c, [WordOccurrenceRecord(None, "demo_base:000003", "world", "world", 0.3, 0.5, 0.80, 0, 0)])
 
-    def test_invalid_mix_mode_raises_error(self) -> None:
-        with self.assertRaises(ValueError):
-            self.mixing_service.build_mix_plan("hello", base_name="demo_base", mix_mode="unsupported")
+        plan = self.mixing_service.build_mix_plan("hello world", base_name="demo_base", job_id="job-2")
+        self.assertEqual(len(plan.items), 2)
+        self.assertEqual(plan.items[0].source_audio_id, "demo_base:000001")
+        self.assertEqual(plan.items[1].source_audio_id, "demo_base:000002")
 
     def test_audio_base_import_overwrites_existing_base(self) -> None:
         def fake_split(

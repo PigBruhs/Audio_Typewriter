@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import random
-import re
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -12,7 +11,7 @@ from pathlib import Path
 from ..core.config import Settings, settings
 from ..db import SQLiteDatabase
 from ..models import MixJobRecord, MixPlanItem, MixResult
-from ..text import tokenize_sentence
+from ..text import normalize_word, tokenize_sentence
 from .index_service import IndexService
 
 
@@ -25,8 +24,8 @@ class MixPlan:
 
 
 class MixingService:
-    _MIX_MODES = {"context_priority", "all_random", "nearest_gap", "farthest_gap"}
-    _CLIP_TIMING_MODES = {"whisper_raw", "experimental_next_word_start"}
+    _FLOAT_EPS = 1e-9
+    _MAX_PHRASE_LEN = 4
 
     def __init__(
         self,
@@ -38,172 +37,137 @@ class MixingService:
         self.database = database or SQLiteDatabase()
         self.index_service = index_service or IndexService(self.database, self.settings)
 
+    def _pick_highest_confidence(self, candidates, rng: random.Random):
+        top_confidence = max(float(candidate.confidence) for candidate in candidates)
+        top_candidates = [
+            candidate
+            for candidate in candidates
+            if abs(float(candidate.confidence) - top_confidence) <= self._FLOAT_EPS
+        ]
+        return rng.choice(top_candidates)
+
     def _select_candidate(
         self,
         candidates,
         previous_source_audio_id: str | None,
-        previous_segment_index: int | None,
         previous_start_sec: float | None,
-        mix_mode: str,
         rng: random.Random,
     ):
-        if mix_mode not in self._MIX_MODES:
-            raise ValueError("mix_mode must be one of: context_priority, all_random, nearest_gap, farthest_gap")
+        # First token: pick highest-confidence candidate; ties are random.
+        if previous_source_audio_id is None or previous_start_sec is None:
+            return self._pick_highest_confidence(candidates, rng)
 
-        if mix_mode == "all_random":
-            return rng.choice(candidates)
-
-        if mix_mode in {"nearest_gap", "farthest_gap"}:
-            if previous_source_audio_id is None or previous_start_sec is None:
-                return rng.choice(candidates)
-            sampled = candidates
-            if len(candidates) > 5:
-                sampled = rng.sample(candidates, 5)
-            return self._pick_by_gap(sampled, previous_source_audio_id, previous_start_sec, mix_mode, rng)
-
-        if previous_source_audio_id is not None and previous_segment_index is not None:
-            same_segment = [
+        # Later tokens: prefer same-source candidates closest to the previous token timestamp.
+        same_source = [candidate for candidate in candidates if candidate.source_audio_id == previous_source_audio_id]
+        if same_source:
+            min_distance = min(abs(float(candidate.start_sec) - previous_start_sec) for candidate in same_source)
+            closest = [
                 candidate
-                for candidate in candidates
-                if candidate.source_audio_id == previous_source_audio_id
-                and candidate.segment_index >= 0
-                and candidate.segment_index == previous_segment_index
+                for candidate in same_source
+                if abs(abs(float(candidate.start_sec) - previous_start_sec) - min_distance) <= self._FLOAT_EPS
             ]
-            if same_segment:
-                return rng.choice(same_segment)
-
-            adjacent_segment = [
+            top_confidence = max(float(candidate.confidence) for candidate in closest)
+            top_closest = [
                 candidate
-                for candidate in candidates
-                if self._is_same_or_adjacent_source(previous_source_audio_id, candidate.source_audio_id)
-                and candidate.segment_index >= 0
-                and candidate.segment_index == previous_segment_index
+                for candidate in closest
+                if abs(float(candidate.confidence) - top_confidence) <= self._FLOAT_EPS
             ]
-            if adjacent_segment:
-                return rng.choice(adjacent_segment)
+            return rng.choice(top_closest)
 
-            same_source = [candidate for candidate in candidates if candidate.source_audio_id == previous_source_audio_id]
-            if same_source:
-                return rng.choice(same_source)
-
-            adjacent_source = [
-                candidate for candidate in candidates if self._is_same_or_adjacent_source(previous_source_audio_id, candidate.source_audio_id)
-            ]
-            if adjacent_source:
-                return rng.choice(adjacent_source)
-
-        return rng.choice(candidates)
-
-    def _source_sequence(self, source_audio_id: str) -> int | None:
-        match = re.search(r"(\d+)$", source_audio_id)
-        if not match:
-            return None
-        try:
-            return int(match.group(1))
-        except ValueError:
-            return None
-
-    def _is_same_or_adjacent_source(self, left_source: str, right_source: str) -> bool:
-        if left_source == right_source:
-            return True
-        left_seq = self._source_sequence(left_source)
-        right_seq = self._source_sequence(right_source)
-        if left_seq is None or right_seq is None:
-            return False
-        return abs(left_seq - right_seq) == 1
-
-    def _gap_tuple(
-        self,
-        previous_source_audio_id: str,
-        previous_start_sec: float,
-        candidate_source_audio_id: str,
-        candidate_start_sec: float,
-    ) -> tuple[int, int, int]:
-        previous_seq = self._source_sequence(previous_source_audio_id)
-        candidate_seq = self._source_sequence(candidate_source_audio_id)
-        if previous_seq is None or candidate_seq is None:
-            audio_gap = 10**9
-        else:
-            # Keep audio gap strictly positive for robust ordering.
-            audio_gap = max(1, abs(previous_seq - candidate_seq))
-
-        previous_min = int(previous_start_sec // 60)
-        previous_sec = int(previous_start_sec) % 60
-        candidate_min = int(candidate_start_sec // 60)
-        candidate_sec = int(candidate_start_sec) % 60
-        minute_delta = previous_min - candidate_min
-        second_delta = previous_sec - candidate_sec
-        return audio_gap, minute_delta, second_delta
-
-    def _pick_by_gap(self, candidates, previous_source_audio_id: str, previous_start_sec: float, mix_mode: str, rng: random.Random):
-        ranked = []
-        for candidate in candidates:
-            audio_gap, minute_delta, second_delta = self._gap_tuple(
-                previous_source_audio_id,
-                previous_start_sec,
-                candidate.source_audio_id,
-                candidate.start_sec,
-            )
-            ranked.append(
-                (
-                    audio_gap,
-                    abs(minute_delta),
-                    abs(second_delta),
-                    rng.random(),
-                    candidate,
-                )
-            )
-
-        if mix_mode == "nearest_gap":
-            ranked.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
-        else:
-            ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
-        return ranked[0][4]
+        # No same-source hit: fallback to highest-confidence from all candidates; ties are random.
+        return self._pick_highest_confidence(candidates, rng)
 
     def build_mix_plan(
         self,
         sentence: str,
         base_name: str,
         job_id: str | None = None,
-        mix_mode: str = "context_priority",
     ) -> MixPlan:
-        if mix_mode not in self._MIX_MODES:
-            raise ValueError("mix_mode must be one of: context_priority, all_random, nearest_gap, farthest_gap")
-
         tokens = tokenize_sentence(sentence)
         if not tokens:
             raise ValueError("Sentence is empty after tokenization.")
 
-        token_search_results = self.index_service.search_tokens(tokens, base_name=base_name)
         items: list[MixPlanItem] = []
         missing_tokens: list[str] = []
-        rng = random.Random(job_id or sentence)
+        rng = random.Random(job_id) if job_id else random.Random()
         previous_source_audio_id: str | None = None
-        previous_segment_index: int | None = None
         previous_start_sec: float | None = None
 
-        for search_result in token_search_results:
-            if not search_result.candidates:
-                missing_tokens.append(search_result.token)
+        index = 0
+        while index < len(tokens):
+            phrase_selected = False
+            remaining = len(tokens) - index
+            max_phrase_len = min(self._MAX_PHRASE_LEN, remaining)
+
+            # Try longer phrases first to reduce dependence on per-word timestamp precision.
+            for phrase_len in range(max_phrase_len, 1, -1):
+                phrase_tokens = tokens[index : index + phrase_len]
+                normalized_phrase_tokens = [normalize_word(token) for token in phrase_tokens]
+                if any(not token for token in normalized_phrase_tokens):
+                    continue
+
+                phrase_candidates = self.database.search_phrase_tokens(
+                    normalized_phrase_tokens,
+                    base_name=base_name,
+                    limit=self.settings.max_candidates_per_token,
+                )
+                if not phrase_candidates:
+                    continue
+
+                selected_phrase = self._select_candidate(
+                    phrase_candidates,
+                    previous_source_audio_id,
+                    previous_start_sec,
+                    rng,
+                )
+                phrase_text = " ".join(phrase_tokens)
+                items.append(
+                    MixPlanItem(
+                        token=phrase_text,
+                        source_audio_id=selected_phrase.source_audio_id,
+                        start_sec=selected_phrase.start_sec,
+                        end_sec=selected_phrase.end_sec,
+                    )
+                )
+                previous_source_audio_id = selected_phrase.source_audio_id
+                previous_start_sec = selected_phrase.start_sec
+                index += phrase_len
+                phrase_selected = True
+                break
+
+            if phrase_selected:
                 continue
+
+            token = tokens[index]
+            normalized = normalize_word(token)
+            if not normalized:
+                missing_tokens.append(token)
+                index += 1
+                continue
+
+            candidates = self.database.search_token(normalized, limit=None, base_name=base_name)
+            if not candidates:
+                missing_tokens.append(token)
+                index += 1
+                continue
+
             selected = self._select_candidate(
-                search_result.candidates,
+                candidates,
                 previous_source_audio_id,
-                previous_segment_index,
                 previous_start_sec,
-                mix_mode,
                 rng,
             )
-            item = MixPlanItem(
-                token=search_result.token,
-                source_audio_id=selected.source_audio_id,
-                start_sec=selected.start_sec,
-                end_sec=selected.end_sec,
+            items.append(
+                MixPlanItem(
+                    token=token,
+                    source_audio_id=selected.source_audio_id,
+                    start_sec=selected.start_sec,
+                    end_sec=selected.end_sec,
+                )
             )
-            items.append(item)
             previous_source_audio_id = selected.source_audio_id
-            previous_segment_index = selected.segment_index
             previous_start_sec = selected.start_sec
+            index += 1
 
         return MixPlan(
             job_id=job_id or str(uuid.uuid4()),
@@ -216,13 +180,8 @@ class MixingService:
         self,
         index: int,
         item: MixPlanItem,
-        next_word_start_sec: float | None,
-        clip_timing_mode: str,
     ) -> str:
-        end_sec = item.end_sec
-        if clip_timing_mode == "experimental_next_word_start" and next_word_start_sec is not None and next_word_start_sec > item.start_sec:
-            end_sec = next_word_start_sec
-        end_sec = max(item.start_sec + 0.001, end_sec)
+        end_sec = max(item.start_sec + 0.001, item.end_sec)
         return (
             f"[{index}:a]atrim=start={item.start_sec:.3f}:end={end_sec:.3f},"
             f"asetpts=PTS-STARTPTS,aresample=44100,aformat=channel_layouts=mono[a{index}]"
@@ -257,14 +216,9 @@ class MixingService:
         insert_word_gap: bool = False,
         word_gap_ms: int | None = None,
         speed_multiplier: float = 1.0,
-        clip_end_padding_ms: int | None = None,
-        clip_timing_mode: str = "whisper_raw",
     ) -> str:
         if not plan.items:
             raise ValueError("No mixable tokens were found.")
-
-        if clip_timing_mode not in self._CLIP_TIMING_MODES:
-            raise ValueError("clip_timing_mode must be one of: whisper_raw, experimental_next_word_start")
 
         self.settings.ensure_directories()
         target_path = Path(output_path or self.settings.mix_output_dir / f"{plan.job_id}.wav")
@@ -282,10 +236,7 @@ class MixingService:
 
         filters: list[str] = []
         for index, item in enumerate(plan.items):
-            next_word_start = None
-            if clip_timing_mode == "experimental_next_word_start":
-                next_word_start = self.database.get_next_word_start(item.source_audio_id, item.start_sec)
-            filters.append(self._segment_filter(index, item, next_word_start, clip_timing_mode))
+            filters.append(self._segment_filter(index, item))
         if len(plan.items) == 1:
             filters.append("[a0]anull[rawout]")
         else:
@@ -378,13 +329,10 @@ class MixingService:
         sentence: str,
         base_name: str,
         output_path: str | Path | None = None,
-        mix_mode: str = "context_priority",
         speed_multiplier: float = 1.0,
         gap_ms: int | None = None,
-        clip_end_padding_ms: int | None = None,
-        clip_timing_mode: str = "whisper_raw",
     ) -> MixResult:
-        plan = self.build_mix_plan(sentence, base_name=base_name, mix_mode=mix_mode)
+        plan = self.build_mix_plan(sentence, base_name=base_name)
         now = datetime.now(timezone.utc).isoformat()
         missing_json = json.dumps(plan.missing_tokens, ensure_ascii=False)
         job_record = MixJobRecord(
@@ -416,8 +364,6 @@ class MixingService:
             insert_word_gap=True,
             word_gap_ms=gap_ms,
             speed_multiplier=speed_multiplier,
-            clip_end_padding_ms=clip_end_padding_ms,
-            clip_timing_mode=clip_timing_mode,
         )
         job_record.status = "completed"
         job_record.output_path = rendered_path

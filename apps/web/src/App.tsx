@@ -77,11 +77,8 @@ function App(): JSX.Element {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [selectedBase, setSelectedBase] = useState("");
   const [selectedStats, setSelectedStats] = useState<AudioBaseItem | null>(null);
-  const [mixMode, setMixMode] = useState("context_priority");
-  const [clipTimingMode, setClipTimingMode] = useState<"whisper_raw" | "experimental_next_word_start">("whisper_raw");
   const [mixSpeed, setMixSpeed] = useState(1);
   const [mixGapMs, setMixGapMs] = useState(100);
-  const [mixClipPaddingMs, setMixClipPaddingMs] = useState(150);
   const [sentence, setSentence] = useState("");
   const [result, setResult] = useState<string>("");
   const [importResult, setImportResult] = useState<string>("");
@@ -96,8 +93,7 @@ function App(): JSX.Element {
   const previousTasksRef = useRef<Record<string, QueueTask>>({});
   const mixSpeedError = Number.isFinite(mixSpeed) && mixSpeed > 0 ? "" : tt("速度必须大于 0。", "Speed must be greater than 0.");
   const mixGapError = Number.isFinite(mixGapMs) && mixGapMs >= 0 ? "" : tt("间隔必须大于或等于 0。", "Gap must be 0 or greater.");
-  const mixClipPaddingError = Number.isFinite(mixClipPaddingMs) && mixClipPaddingMs >= 0 ? "" : tt("尾部补偿必须大于或等于 0。", "Clip end padding must be 0 or greater.");
-  const hasMixInputError = Boolean(mixSpeedError || mixGapError || mixClipPaddingError);
+  const hasMixInputError = Boolean(mixSpeedError || mixGapError);
 
   function appendImportLog(message: string): void {
     setImportLogs((prev) => {
@@ -399,7 +395,7 @@ function App(): JSX.Element {
       return;
     }
     if (hasMixInputError) {
-      const message = [mixSpeedError, mixGapError, mixClipPaddingError].filter(Boolean).join(" ");
+      const message = [mixSpeedError, mixGapError].filter(Boolean).join(" ");
       setResult(message || tt("请修正活字印刷参数。", "Please fix mix input values."));
       appendImportLog(`[${mixTag}][ERROR] ${message || tt("请修正活字印刷参数。", "Please fix mix input values.")}`);
       return;
@@ -407,7 +403,7 @@ function App(): JSX.Element {
     setLoading(true);
     setResult("");
     try {
-      const data = await requestMix(selectedBase, sentence, mixMode, mixSpeed, mixGapMs, mixClipPaddingMs, clipTimingMode);
+      const data = await requestMix(selectedBase, sentence, mixSpeed, mixGapMs);
       setResult(tt(`音频库=${selectedBase}, 任务=${data.job_id}, 状态=${data.status}`, `base=${selectedBase}, job=${data.job_id}, status=${data.status}`));
       appendImportLog(`[${mixTag}] base=${selectedBase}, job=${data.job_id}, status=${data.status}`);
     } catch (error) {
@@ -498,20 +494,6 @@ function App(): JSX.Element {
 
       <h2>{tt("创建活字印刷", "Create Mix")}</h2>
       <form onSubmit={onSubmit}>
-        <select value={mixMode} onChange={(event) => setMixMode(event.target.value)} style={{ width: "100%", marginBottom: 8 }}>
-          <option value="context_priority">{tt("语境优先（同段/相邻段优先）", "Context Priority (same/adjacent clip first)")}</option>
-          <option value="all_random">{tt("完全随机", "All Random")}</option>
-          <option value="nearest_gap">{tt("间隔最近优先", "Nearest Gap Priority")}</option>
-          <option value="farthest_gap">{tt("间隔最远优先", "Farthest Gap Priority")}</option>
-        </select>
-        <select
-          value={clipTimingMode}
-          onChange={(event) => setClipTimingMode(event.target.value as "whisper_raw" | "experimental_next_word_start")}
-          style={{ width: "100%", marginBottom: 8 }}
-        >
-          <option value="whisper_raw">{tt("时间策略：Whisper 原始（start -&gt; end）", "Timing: Whisper Raw (start -&gt; end)")}</option>
-          <option value="experimental_next_word_start">{tt("时间策略：实验（start -&gt; 物理下一个词 start）", "Timing: Experimental (start -&gt; next physical word start)")}</option>
-        </select>
         <textarea
           rows={4}
           value={sentence}
@@ -519,7 +501,7 @@ function App(): JSX.Element {
           style={{ width: "100%" }}
           placeholder={tt("在这里输入目标句子...", "Type sentence here...")}
         />
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 8, marginBottom: 8 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8, marginBottom: 8 }}>
           <label>
             {tt("变速 (x)", "Speed (x)")}
             <input
@@ -543,18 +525,6 @@ function App(): JSX.Element {
               style={{ width: "100%" }}
             />
             {mixGapError && <div style={{ color: "crimson", fontSize: 12 }}>{mixGapError}</div>}
-          </label>
-          <label>
-            {tt("尾部补偿 (ms)", "End Padding (ms)")}
-            <input
-              type="number"
-              min={0}
-              step={10}
-              value={mixClipPaddingMs}
-              onChange={(event) => setMixClipPaddingMs(Number(event.target.value))}
-              style={{ width: "100%" }}
-            />
-            {mixClipPaddingError && <div style={{ color: "crimson", fontSize: 12 }}>{mixClipPaddingError}</div>}
           </label>
         </div>
         <button type="submit" disabled={loading || !selectedBase || sentence.trim().length === 0 || hasMixInputError}>

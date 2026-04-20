@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Literal
-
 from pydantic import BaseModel, Field
 
 
@@ -35,17 +33,8 @@ class IngestResponse(BaseModel):
 class MixRequest(BaseModel):
     base_name: str = Field(..., min_length=1)
     sentence: str = Field(..., min_length=1)
-    mix_mode: str = Field(
-        default="context_priority",
-        description="context_priority, all_random, nearest_gap, or farthest_gap",
-    )
     speed_multiplier: float = Field(default=1.0, gt=0.0, description="Playback speed multiplier")
     gap_ms: int = Field(default=100, ge=0, description="Silence gap in milliseconds between words")
-    clip_end_padding_ms: int = Field(default=150, ge=0, description="Extra milliseconds appended to each token end")
-    clip_timing_mode: Literal["whisper_raw", "experimental_next_word_start"] = Field(
-        default="whisper_raw",
-        description="whisper_raw uses ASR start/end; experimental_next_word_start uses start to next physical word start in same source audio",
-    )
     output_path: str | None = None
 
 

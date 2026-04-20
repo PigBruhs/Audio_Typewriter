@@ -116,11 +116,8 @@ async function readErrorDetail(response: Response): Promise<string> {
 export async function requestMix(
   baseName: string,
   sentence: string,
-  mixMode: string,
   speedMultiplier: number,
-  gapMs: number,
-  clipEndPaddingMs: number,
-  clipTimingMode: "whisper_raw" | "experimental_next_word_start"
+  gapMs: number
 ): Promise<MixResponse> {
   const response = await fetch("/api/v1/mix", {
     method: "POST",
@@ -130,11 +127,8 @@ export async function requestMix(
     body: JSON.stringify({
       base_name: baseName,
       sentence,
-      mix_mode: mixMode,
       speed_multiplier: speedMultiplier,
       gap_ms: gapMs,
-      clip_end_padding_ms: clipEndPaddingMs,
-      clip_timing_mode: clipTimingMode,
     }),
   });
 
