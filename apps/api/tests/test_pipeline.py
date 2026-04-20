@@ -670,6 +670,140 @@ class PipelineTests(unittest.TestCase):
             filter_graph = command[command.index("-filter_complex") + 1]
             self.assertIn("atempo=1.500000", filter_graph)
 
+    def test_mix_sentence_segment_output_exports_files_with_expansion(self) -> None:
+        now = "2026-01-01T00:00:00+00:00"
+        source = AudioSourceRecord(
+            source_audio_id="demo_base:seg001",
+            base_name="demo_base",
+            source_path="audio_base/demo_base/seg001.wav",
+            language="en",
+            model_tier="base",
+            device="cpu",
+            compute_type="int8",
+            created_at=now,
+            updated_at=now,
+        )
+        self.database.upsert_audio_source(source)
+        self.index_service.ingest(
+            source,
+            [
+                WordOccurrenceRecord(None, "demo_base:seg001", "hello", "hello", 0.0, 0.2, 0.9, 0, 0),
+                WordOccurrenceRecord(None, "demo_base:seg001", "world", "world", 0.3, 0.5, 0.9, 0, 1),
+            ],
+        )
+        self.database.create_audio_base(
+            AudioBaseRecord(
+                base_name="demo_base",
+                base_path=str(self.settings.audio_base_dir / "demo_base"),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        self.database.replace_audio_base_files(
+            "demo_base",
+            [
+                AudioBaseFileRecord(
+                    source_audio_id="demo_base:seg001",
+                    base_name="demo_base",
+                    sequence_number=1,
+                    file_name="seg001.wav",
+                    file_path="audio_base/demo_base/seg001.wav",
+                    duration_sec=1.0,
+                    file_size_bytes=1,
+                    created_at=now,
+                )
+            ],
+        )
+
+        with patch("app.services.mixing_service.subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = ""
+            run_mock.return_value.stderr = ""
+
+            result = self.mixing_service.mix_sentence(
+                "hello world",
+                base_name="demo_base",
+                mix_mode="word",
+                output_mode="segment_output",
+                segment_expansion_ms=500,
+            )
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.token_count, 2)
+            self.assertEqual(len(result.output_files or []), 2)
+            self.assertIn("hello.wav", result.output_files[0])
+            self.assertIn("world.wav", result.output_files[1])
+            self.assertEqual(run_mock.call_count, 2)
+            graph_0 = run_mock.call_args_list[0].args[0]
+            graph_0 = graph_0[graph_0.index("-filter_complex") + 1]
+            self.assertIn("atrim=start=0.000:end=0.700", graph_0)
+            graph_1 = run_mock.call_args_list[1].args[0]
+            graph_1 = graph_1[graph_1.index("-filter_complex") + 1]
+            self.assertIn("atrim=start=0.000:end=1.000", graph_1)
+
+    def test_mix_sentence_segment_output_uses_unique_filenames_for_duplicates(self) -> None:
+        now = "2026-01-01T00:00:00+00:00"
+        source = AudioSourceRecord(
+            source_audio_id="demo_base:seg002",
+            base_name="demo_base",
+            source_path="audio_base/demo_base/seg002.wav",
+            language="en",
+            model_tier="base",
+            device="cpu",
+            compute_type="int8",
+            created_at=now,
+            updated_at=now,
+        )
+        self.database.upsert_audio_source(source)
+        self.index_service.ingest(
+            source,
+            [
+                WordOccurrenceRecord(None, "demo_base:seg002", "hello", "hello", 0.0, 0.1, 0.9, 0, 0),
+                WordOccurrenceRecord(None, "demo_base:seg002", "hello", "hello", 0.2, 0.3, 0.9, 0, 1),
+            ],
+        )
+        self.database.create_audio_base(
+            AudioBaseRecord(
+                base_name="demo_base",
+                base_path=str(self.settings.audio_base_dir / "demo_base"),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        self.database.replace_audio_base_files(
+            "demo_base",
+            [
+                AudioBaseFileRecord(
+                    source_audio_id="demo_base:seg002",
+                    base_name="demo_base",
+                    sequence_number=1,
+                    file_name="seg002.wav",
+                    file_path="audio_base/demo_base/seg002.wav",
+                    duration_sec=1.0,
+                    file_size_bytes=1,
+                    created_at=now,
+                )
+            ],
+        )
+
+        with patch("app.services.mixing_service.subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = ""
+            run_mock.return_value.stderr = ""
+
+            result = self.mixing_service.mix_sentence(
+                "hello hello",
+                base_name="demo_base",
+                mix_mode="word",
+                output_mode="segment_output",
+                segment_expansion_ms=100,
+            )
+
+            outputs = result.output_files or []
+            self.assertEqual(len(outputs), 2)
+            self.assertTrue(outputs[0].endswith("hello.wav"))
+            self.assertTrue(outputs[1].endswith("hello_2.wav"))
+
     def test_mix_plan_first_word_sentence_seed_uses_best_segment(self) -> None:
         source_a = AudioSourceRecord(
             source_audio_id="demo_base:000001",

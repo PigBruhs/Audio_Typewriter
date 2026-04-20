@@ -605,12 +605,15 @@ def create_mix(payload: MixRequest) -> MixResponse:
             gap_ms=payload.gap_ms,
             mix_mode=payload.mix_mode,
             tail_extension_ms=payload.tail_extension_ms,
+            output_mode=payload.output_mode,
+            segment_expansion_ms=payload.segment_expansion_ms,
         )
         return MixResponse(
             job_id=result.job_id,
             base_name=result.base_name,
             status=result.status,
             output_path=result.output_path,
+            output_files=result.output_files or [],
             missing_tokens=result.missing_tokens,
             token_count=result.token_count,
         )
@@ -642,6 +645,7 @@ def stitch_mix(payload: StitchRequest) -> MixResponse:
             base_name=result.base_name,
             status=result.status,
             output_path=result.output_path,
+            output_files=result.output_files or [],
             missing_tokens=result.missing_tokens,
             token_count=result.token_count,
         )

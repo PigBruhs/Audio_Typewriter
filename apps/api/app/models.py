@@ -70,6 +70,7 @@ class MixResult:
     base_name: str | None = None
     device_used: str | None = None
     token_count: int = 0
+    output_files: list[str] | None = None
 
 
 @dataclass(slots=True)

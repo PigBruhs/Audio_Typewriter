@@ -12,6 +12,8 @@ import {
   listAudioBases,
   pauseQueueTask,
   QueueTask,
+  MixMode,
+  MixOutputMode,
   requestReAsr,
   requestSystemExit,
   resumeQueueTask,
@@ -79,8 +81,10 @@ function App(): JSX.Element {
   const [selectedStats, setSelectedStats] = useState<AudioBaseItem | null>(null);
   const [mixSpeed, setMixSpeed] = useState(1);
   const [mixGapMs, setMixGapMs] = useState(100);
-  const [mixMode, setMixMode] = useState<"word" | "word_phrase" | "word_phrase_sentence">("word_phrase_sentence");
+  const [mixMode, setMixMode] = useState<MixMode>("word_phrase_sentence");
+  const [mixOutputMode, setMixOutputMode] = useState<MixOutputMode>("mix");
   const [tailExtensionMs, setTailExtensionMs] = useState(20);
+  const [segmentExpansionMs, setSegmentExpansionMs] = useState(500);
   const [sentence, setSentence] = useState("");
   const [result, setResult] = useState<string>("");
   const [importResult, setImportResult] = useState<string>("");
@@ -99,7 +103,14 @@ function App(): JSX.Element {
     Number.isFinite(tailExtensionMs) && tailExtensionMs >= 0
       ? ""
       : tt("补尾必须大于或等于 0。", "Tail extension must be 0 or greater.");
-  const hasMixInputError = Boolean(mixSpeedError || mixGapError || tailExtensionError);
+  const segmentExpansionError =
+    Number.isFinite(segmentExpansionMs) && segmentExpansionMs >= 0
+      ? ""
+      : tt("片段扩充时长必须大于或等于 0。", "Segment expansion must be 0 or greater.");
+  const hasMixInputError =
+    mixOutputMode === "segment_output"
+      ? Boolean(segmentExpansionError)
+      : Boolean(mixSpeedError || mixGapError || tailExtensionError);
 
   function appendImportLog(message: string): void {
     setImportLogs((prev) => {
@@ -383,7 +394,13 @@ function App(): JSX.Element {
       return;
     }
     if (hasMixInputError) {
-      const message = [mixSpeedError, mixGapError].filter(Boolean).join(" ");
+      const message = (
+        mixOutputMode === "segment_output"
+          ? [segmentExpansionError]
+          : [mixSpeedError, mixGapError, tailExtensionError]
+      )
+        .filter(Boolean)
+        .join(" ");
       setResult(message || tt("请修正活字印刷参数。", "Please fix mix input values."));
       appendImportLog(`[${mixTag}][ERROR] ${message || tt("请修正活字印刷参数。", "Please fix mix input values.")}`);
       return;
@@ -391,9 +408,22 @@ function App(): JSX.Element {
     setLoading(true);
     setResult("");
     try {
-      const data = await requestMix(selectedBase, sentence, mixSpeed, mixGapMs, mixMode, tailExtensionMs);
+      const data = await requestMix(
+        selectedBase,
+        sentence,
+        mixSpeed,
+        mixGapMs,
+        mixMode,
+        tailExtensionMs,
+        mixOutputMode,
+        segmentExpansionMs
+      );
       setResult(tt(`音频库=${selectedBase}, 任务=${data.job_id}, 状态=${data.status}`, `base=${selectedBase}, job=${data.job_id}, status=${data.status}`));
       appendImportLog(`[${mixTag}] base=${selectedBase}, job=${data.job_id}, status=${data.status}`);
+      if (mixOutputMode === "segment_output") {
+        const fileCount = data.output_files?.length ?? 0;
+        appendImportLog(`[${mixTag}] segment output ready: folder=${data.output_path ?? ""}, files=${fileCount}`);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : tt("未知错误", "Unknown error");
       setResult(message);
@@ -405,7 +435,7 @@ function App(): JSX.Element {
 
   return (
     <main style={{ maxWidth: 680, margin: "40px auto", fontFamily: "sans-serif" }}>
-      <h1>{tt("音频打字机", "Audio Typewriter")}</h1>
+      <h1>{tt("活字印刷机", "Audio Typewriter")}</h1>
       <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
         <button type="button" onClick={() => setActiveTab("workbench")}>{tt("工作台", "Workbench")}</button>
         <button type="button" onClick={() => setActiveTab("tasks")}>{tt("任务", "Tasks")}</button>
@@ -491,6 +521,17 @@ function App(): JSX.Element {
         />
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8, marginBottom: 8 }}>
           <label>
+            {tt("输出模式", "Output Mode")}
+            <select
+              value={mixOutputMode}
+              onChange={(event) => setMixOutputMode(event.target.value as MixOutputMode)}
+              style={{ width: "100%" }}
+            >
+              <option value="mix">{tt("拼接输出", "Mixed Output")}</option>
+              <option value="segment_output">{tt("片段输出", "Segment Output")}</option>
+            </select>
+          </label>
+          <label>
             {tt("变速 (x)", "Speed (x)")}
             <input
               type="number"
@@ -499,8 +540,9 @@ function App(): JSX.Element {
               value={mixSpeed}
               onChange={(event) => setMixSpeed(Number(event.target.value))}
               style={{ width: "100%" }}
+              disabled={mixOutputMode === "segment_output"}
             />
-            {mixSpeedError && <div style={{ color: "crimson", fontSize: 12 }}>{mixSpeedError}</div>}
+            {mixOutputMode !== "segment_output" && mixSpeedError && <div style={{ color: "crimson", fontSize: 12 }}>{mixSpeedError}</div>}
           </label>
           <label>
             {tt("间隔 (ms)", "Gap (ms)")}
@@ -511,14 +553,15 @@ function App(): JSX.Element {
               value={mixGapMs}
               onChange={(event) => setMixGapMs(Number(event.target.value))}
               style={{ width: "100%" }}
+              disabled={mixOutputMode === "segment_output"}
             />
-            {mixGapError && <div style={{ color: "crimson", fontSize: 12 }}>{mixGapError}</div>}
+            {mixOutputMode !== "segment_output" && mixGapError && <div style={{ color: "crimson", fontSize: 12 }}>{mixGapError}</div>}
           </label>
           <label>
             {tt("拼接模式", "Mix Mode")}
             <select
               value={mixMode}
-              onChange={(event) => setMixMode(event.target.value as "word" | "word_phrase" | "word_phrase_sentence")}
+              onChange={(event) => setMixMode(event.target.value as MixMode)}
               style={{ width: "100%" }}
             >
               <option value="word">{tt("词级", "Word")}</option>
@@ -526,18 +569,33 @@ function App(): JSX.Element {
               <option value="word_phrase_sentence">{tt("词 + 短语 + 句子", "Word + Phrase + Sentence")}</option>
             </select>
           </label>
-          <label>
-            {tt("补尾随机上限 (ms)", "Tail Extension Max (ms)")}
-            <input
-              type="number"
-              min={0}
-              step={1}
-              value={tailExtensionMs}
-              onChange={(event) => setTailExtensionMs(Number(event.target.value))}
-              style={{ width: "100%" }}
-            />
-            {tailExtensionError && <div style={{ color: "crimson", fontSize: 12 }}>{tailExtensionError}</div>}
-          </label>
+          {mixOutputMode === "segment_output" ? (
+            <label>
+              {tt("片段扩充时长 (ms)", "Segment Expansion (ms)")}
+              <input
+                type="number"
+                min={0}
+                step={10}
+                value={segmentExpansionMs}
+                onChange={(event) => setSegmentExpansionMs(Number(event.target.value))}
+                style={{ width: "100%" }}
+              />
+              {segmentExpansionError && <div style={{ color: "crimson", fontSize: 12 }}>{segmentExpansionError}</div>}
+            </label>
+          ) : (
+            <label>
+              {tt("补尾随机上限 (ms)", "Tail Extension Max (ms)")}
+              <input
+                type="number"
+                min={0}
+                step={1}
+                value={tailExtensionMs}
+                onChange={(event) => setTailExtensionMs(Number(event.target.value))}
+                style={{ width: "100%" }}
+              />
+              {tailExtensionError && <div style={{ color: "crimson", fontSize: 12 }}>{tailExtensionError}</div>}
+            </label>
+          )}
         </div>
         <button type="submit" disabled={loading || !selectedBase || sentence.trim().length === 0 || hasMixInputError}>
           {loading ? tt("提交中...", "Submitting...") : tt("创建活字印刷任务", "Create Mix Job")}

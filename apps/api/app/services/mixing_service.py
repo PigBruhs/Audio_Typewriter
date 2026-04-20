@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ class MixingService:
     _FLOAT_EPS = 1e-9
     _MAX_PHRASE_LEN = 4
     _SUPPORTED_MIX_MODES = {"word", "word_phrase", "word_phrase_sentence"}
+    _SUPPORTED_OUTPUT_MODES = {"mix", "segment_output"}
 
     def __init__(
         self,
@@ -304,6 +306,107 @@ class MixingService:
         if item.end_sec <= item.start_sec:
             raise ValueError(f"Invalid segment for {item.source_audio_id}: end_sec must be > start_sec")
 
+    def _sanitize_segment_filename_stem(self, token: str) -> str:
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "", str(token or "")).strip().strip(".")
+        stem = " ".join(stem.split())
+        if not stem:
+            return "segment"
+        return stem[:80]
+
+    def _resolve_source_path_and_duration(
+        self,
+        item: MixPlanItem,
+        *,
+        base_name: str | None,
+    ) -> tuple[str, float | None]:
+        if base_name:
+            source_path = self.database.get_audio_source_path_for_base(item.source_audio_id, base_name)
+            source_duration = self.database.get_audio_source_duration_for_base(item.source_audio_id, base_name)
+        else:
+            source_path = self.database.get_audio_source_path(item.source_audio_id)
+            source_duration = None
+        if not source_path:
+            raise ValueError(f"Audio source not found for id: {item.source_audio_id}")
+        return source_path, source_duration
+
+    def _render_single_segment_clip(
+        self,
+        *,
+        source_path: str,
+        start_sec: float,
+        end_sec: float,
+        target_path: Path,
+    ) -> None:
+        command = [
+            self.settings.ffmpeg_binary,
+            "-y",
+            "-i",
+            source_path,
+            "-filter_complex",
+            (
+                f"[0:a]atrim=start={start_sec:.3f}:end={end_sec:.3f},"
+                "asetpts=PTS-STARTPTS,aresample=44100,aformat=channel_layouts=mono[outa]"
+            ),
+            "-map",
+            "[outa]",
+            "-acodec",
+            "pcm_s16le",
+            str(target_path),
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "ffmpeg segment render failed:\n"
+                f"STDOUT:\n{completed.stdout}\nSTDERR:\n{completed.stderr}"
+            )
+
+    def render_segment_outputs(
+        self,
+        plan: MixPlan,
+        *,
+        base_name: str,
+        output_path: str | Path | None = None,
+        segment_expansion_ms: int = 500,
+    ) -> tuple[str, list[str]]:
+        if not plan.items:
+            raise ValueError("No mixable tokens were found.")
+
+        self.settings.ensure_directories()
+        output_root = Path(output_path) if output_path else Path(self.settings.mix_output_dir)
+        target_dir = output_root / plan.job_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        expansion_sec = max(0.0, float(segment_expansion_ms) / 1000.0)
+        name_counts: dict[str, int] = {}
+        output_files: list[str] = []
+
+        for item in plan.items:
+            source_path, source_duration = self._resolve_source_path_and_duration(item, base_name=base_name)
+
+            start_sec = max(0.0, float(item.start_sec) - expansion_sec)
+            end_sec = float(item.end_sec) + expansion_sec
+            if source_duration is not None and source_duration > 0:
+                source_end = float(source_duration)
+                start_sec = min(start_sec, max(0.0, source_end - 0.001))
+                end_sec = min(end_sec, source_end)
+            end_sec = max(end_sec, start_sec + 0.001)
+
+            stem = self._sanitize_segment_filename_stem(item.token)
+            seen_count = name_counts.get(stem, 0)
+            name_counts[stem] = seen_count + 1
+            file_name = f"{stem}.wav" if seen_count == 0 else f"{stem}_{seen_count + 1}.wav"
+            target_path = target_dir / file_name
+
+            self._render_single_segment_clip(
+                source_path=source_path,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                target_path=target_path,
+            )
+            output_files.append(str(target_path))
+
+        return str(target_dir), output_files
+
     def render_plan(
         self,
         plan: MixPlan,
@@ -453,8 +556,13 @@ class MixingService:
         gap_ms: int | None = None,
         mix_mode: str = "word_phrase_sentence",
         tail_extension_ms: int = 20,
+        output_mode: str = "mix",
+        segment_expansion_ms: int = 500,
     ) -> MixResult:
         plan = self.build_mix_plan(sentence, base_name=base_name, mix_mode=mix_mode)
+        normalized_output_mode = str(output_mode or "mix").strip().lower()
+        if normalized_output_mode not in self._SUPPORTED_OUTPUT_MODES:
+            raise ValueError(f"Unsupported output_mode: {output_mode}")
         now = datetime.now(timezone.utc).isoformat()
         missing_json = json.dumps(plan.missing_tokens, ensure_ascii=False)
         job_record = MixJobRecord(
@@ -479,15 +587,24 @@ class MixingService:
                 f"Mix aborted: missing tokens in base '{base_name}': {missing_preview}"
             )
 
-        rendered_path = self.render_plan(
-            plan,
-            output_path=output_path,
-            base_name=base_name,
-            insert_word_gap=True,
-            word_gap_ms=gap_ms,
-            speed_multiplier=speed_multiplier,
-            tail_extension_ms=tail_extension_ms,
-        )
+        output_files: list[str] | None = None
+        if normalized_output_mode == "segment_output":
+            rendered_path, output_files = self.render_segment_outputs(
+                plan,
+                base_name=base_name,
+                output_path=output_path,
+                segment_expansion_ms=segment_expansion_ms,
+            )
+        else:
+            rendered_path = self.render_plan(
+                plan,
+                output_path=output_path,
+                base_name=base_name,
+                insert_word_gap=True,
+                word_gap_ms=gap_ms,
+                speed_multiplier=speed_multiplier,
+                tail_extension_ms=tail_extension_ms,
+            )
         job_record.status = "completed"
         job_record.output_path = rendered_path
         job_record.missing_tokens = missing_json
@@ -500,4 +617,5 @@ class MixingService:
             missing_tokens=[],
             base_name=base_name,
             token_count=len(plan.items),
+            output_files=output_files,
         )

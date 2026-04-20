@@ -47,6 +47,16 @@ class MixRequest(BaseModel):
         le=500,
         description="Random tail extension range (0..N ms) per clip, capped by source end.",
     )
+    output_mode: Literal["mix", "segment_output"] = Field(
+        default="mix",
+        description="mix: render a stitched sentence wav, segment_output: render per-segment wav files",
+    )
+    segment_expansion_ms: int = Field(
+        default=500,
+        ge=0,
+        le=5000,
+        description="For segment_output mode: expand both start/end by this amount when exporting each clip.",
+    )
     output_path: str | None = None
 
 
@@ -55,6 +65,7 @@ class MixResponse(BaseModel):
     base_name: str | None = None
     status: str
     output_path: str | None = None
+    output_files: list[str] = Field(default_factory=list)
     missing_tokens: list[str] = Field(default_factory=list)
     token_count: int = 0
 

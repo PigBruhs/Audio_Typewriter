@@ -3,9 +3,13 @@ export type MixResponse = {
   base_name?: string | null;
   status: string;
   output_path?: string | null;
+  output_files?: string[];
   missing_tokens?: string[];
   token_count?: number;
 };
+
+export type MixMode = "word" | "word_phrase" | "word_phrase_sentence";
+export type MixOutputMode = "mix" | "segment_output";
 
 export type StitchSegment = {
   source_audio_id: string;
@@ -120,8 +124,10 @@ export async function requestMix(
   sentence: string,
   speedMultiplier: number,
   gapMs: number,
-  mixMode: "word" | "word_phrase" | "word_phrase_sentence",
-  tailExtensionMs: number
+  mixMode: MixMode,
+  tailExtensionMs: number,
+  outputMode: MixOutputMode,
+  segmentExpansionMs: number
 ): Promise<MixResponse> {
   const response = await fetch("/api/v1/mix", {
     method: "POST",
@@ -135,6 +141,8 @@ export async function requestMix(
       gap_ms: gapMs,
       mix_mode: mixMode,
       tail_extension_ms: tailExtensionMs,
+      output_mode: outputMode,
+      segment_expansion_ms: segmentExpansionMs,
     }),
   });
 
