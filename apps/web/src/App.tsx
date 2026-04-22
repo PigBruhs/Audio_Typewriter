@@ -271,7 +271,7 @@ function App(): JSX.Element {
         }
       };
 
-      const data = await importAudioBaseByPathStream(baseName.trim(), sourceFolderPath.trim(), onStreamEvent);
+      const data = await importAudioBaseByPathStream(baseName.trim(), sourceFolderPath.trim(), language, onStreamEvent);
       const overwriteLabel = data.overwritten
         ? tt(
             `覆写=是(清理文件=${data.cleared_audio_files}, 清理索引源=${data.cleared_index_sources})`,

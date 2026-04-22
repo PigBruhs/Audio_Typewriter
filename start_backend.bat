@@ -18,9 +18,6 @@ if not defined PYTHONPATH set "PYTHONPATH=%ROOT%\apps\api;%ROOT%\packages\core"
 if not defined AT_APP_ENV set "AT_APP_ENV=dev"
 if not defined AT_ASR_DEVICE set "AT_ASR_DEVICE=cuda"
 if not defined AT_ASR_ALIGNMENT_BACKEND set "AT_ASR_ALIGNMENT_BACKEND=auto"
-if not defined AT_ASR_MFA_BINARY set "AT_ASR_MFA_BINARY=D:\Anaconda\envs\mfa\Scripts\mfa.exe"
-if not defined AT_ASR_MFA_DICTIONARY_PATH set "AT_ASR_MFA_DICTIONARY_PATH=C:\Users\Ecthelion\Documents\MFA\pretrained_models\dictionary\english_us_arpa.dict"
-if not defined AT_ASR_MFA_ACOUSTIC_MODEL_PATH set "AT_ASR_MFA_ACOUSTIC_MODEL_PATH=C:\Users\Ecthelion\Documents\MFA\pretrained_models\acoustic\english_us_arpa.zip"
 
 set "MFA_ENABLED=0"
 set "MFA_READY=0"
@@ -39,6 +36,7 @@ if /I "%~1"=="--dry-run" (
     if not exist "%AT_ASR_MFA_BINARY%" echo [DRY-RUN][WARN] MFA binary not found: "%AT_ASR_MFA_BINARY%"
     if not defined AT_ASR_MFA_DICTIONARY_PATH echo [DRY-RUN][WARN] AT_ASR_MFA_DICTIONARY_PATH is not set.
     if not defined AT_ASR_MFA_ACOUSTIC_MODEL_PATH echo [DRY-RUN][WARN] AT_ASR_MFA_ACOUSTIC_MODEL_PATH is not set.
+    if /I "%MFA_READY%"=="0" call :print_mfa_setup_hint
   )
   echo [DRY-RUN] "%PYTHON_EXE%" -m uvicorn app.main:app --host %API_HOST% --port %API_PORT% --app-dir apps/api
   exit /b 0
@@ -52,6 +50,7 @@ if /I "%MFA_ENABLED%"=="1" (
   if not exist "%AT_ASR_MFA_BINARY%" echo [WARN] MFA binary not found: "%AT_ASR_MFA_BINARY%"
   if not defined AT_ASR_MFA_DICTIONARY_PATH echo [WARN] AT_ASR_MFA_DICTIONARY_PATH is not set.
   if not defined AT_ASR_MFA_ACOUSTIC_MODEL_PATH echo [WARN] AT_ASR_MFA_ACOUSTIC_MODEL_PATH is not set.
+  if /I "%MFA_READY%"=="0" call :print_mfa_setup_hint
 )
 
 cd /d "%ROOT%"
@@ -79,5 +78,13 @@ if /I "%MFA_READY%"=="1" (
 ) else (
   set "MFA_STATUS=enabled_incomplete"
 )
+goto :eof
+
+:print_mfa_setup_hint
+echo [MFA][INFO] MFA config is incomplete, fallback alignment will be used.
+echo [MFA][INFO] Search online for Montreal Forced Aligner Windows setup, then fill these in start.bat:
+echo [MFA][INFO]   set "AT_ASR_MFA_BINARY=path_to_mfa_exe"
+echo [MFA][INFO]   set "AT_ASR_MFA_DICTIONARY_PATH=path_to_dictionary_dict"
+echo [MFA][INFO]   set "AT_ASR_MFA_ACOUSTIC_MODEL_PATH=path_to_acoustic_zip"
 goto :eof
 

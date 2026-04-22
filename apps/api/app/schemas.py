@@ -115,6 +115,7 @@ class AudioBaseImportResponse(BaseModel):
 class LocalAudioBaseImportRequest(BaseModel):
     base_name: str = Field(..., min_length=1, max_length=64)
     folder_path: str = Field(..., min_length=1, description="Local folder path containing .wav/.mp3 files")
+    language: Literal["en", "zh"] = Field(default="en", description="ASR language for this import task")
 
 
 class AudioBaseListItem(BaseModel):

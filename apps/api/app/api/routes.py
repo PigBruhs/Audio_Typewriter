@@ -66,6 +66,7 @@ def _run_audio_base_import(
     *,
     base_name: str,
     files: list[UploadFile],
+    language: str,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> AudioBaseImportResponse:
     normalized_base_name = _audio_base_service.validate_base_name(base_name)
@@ -93,6 +94,7 @@ def _run_audio_base_import(
         base_name=normalized_base_name,
         task_id=task_id,
         model_tier="large",
+        asr_language=language,
         overwritten=overwritten,
         cleared_audio_files=cleared_audio_files,
         cleared_index_sources=cleared_index_sources,
@@ -197,6 +199,7 @@ def _run_audio_base_import_from_folder(
     *,
     base_name: str,
     folder_path: str,
+    language: str,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> AudioBaseImportResponse:
     normalized_base_name = _audio_base_service.validate_base_name(base_name)
@@ -224,6 +227,7 @@ def _run_audio_base_import_from_folder(
         base_name=normalized_base_name,
         task_id=task_id,
         model_tier="large",
+        asr_language=language,
         overwritten=overwritten,
         cleared_audio_files=cleared_audio_files,
         cleared_index_sources=cleared_index_sources,
@@ -308,7 +312,16 @@ def _run_audio_base_import_from_folder(
     return response
 
 
-async def _parse_import_form(request: Request) -> tuple[str, list[UploadFile]]:
+def _normalize_import_language(language: str | None) -> str:
+    candidate = str(language or "").strip().lower()
+    if candidate.startswith("zh"):
+        return "zh"
+    if candidate.startswith("en"):
+        return "en"
+    return _asr_service.settings.asr_default_language
+
+
+async def _parse_import_form(request: Request) -> tuple[str, list[UploadFile], str]:
     try:
         form = await request.form(
             max_files=max(1, int(_audio_base_service.settings.multipart_max_files)),
@@ -333,7 +346,8 @@ async def _parse_import_form(request: Request) -> tuple[str, list[UploadFile]]:
     files = [item for item in form.getlist("files") if hasattr(item, "filename") and hasattr(item, "file")]
     if not files:
         raise HTTPException(status_code=400, detail="Import failed: no valid .wav/.mp3 upload files were provided.")
-    return base_name, cast(list[UploadFile], files)
+    language = _normalize_import_language(str(form.get("language") or ""))
+    return base_name, cast(list[UploadFile], files), language
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -351,9 +365,9 @@ def health() -> HealthResponse:
 
 @router.post("/audio-bases/import", response_model=AudioBaseImportResponse)
 async def import_audio_base(request: Request) -> AudioBaseImportResponse:
-    base_name, files = await _parse_import_form(request)
+    base_name, files, language = await _parse_import_form(request)
     try:
-        return _run_audio_base_import(base_name=base_name, files=files)
+        return _run_audio_base_import(base_name=base_name, files=files, language=language)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -363,7 +377,11 @@ async def import_audio_base(request: Request) -> AudioBaseImportResponse:
 @router.post("/audio-bases/import/local", response_model=AudioBaseImportResponse)
 def import_audio_base_local(payload: LocalAudioBaseImportRequest) -> AudioBaseImportResponse:
     try:
-        return _run_audio_base_import_from_folder(base_name=payload.base_name, folder_path=payload.folder_path)
+        return _run_audio_base_import_from_folder(
+            base_name=payload.base_name,
+            folder_path=payload.folder_path,
+            language=_normalize_import_language(payload.language),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -372,7 +390,7 @@ def import_audio_base_local(payload: LocalAudioBaseImportRequest) -> AudioBaseIm
 
 @router.post("/audio-bases/import/stream")
 async def import_audio_base_stream(request: Request) -> StreamingResponse:
-    base_name, files = await _parse_import_form(request)
+    base_name, files, language = await _parse_import_form(request)
 
     def _iter_events():
         event_queue: Queue[dict[str, object]] = Queue()
@@ -385,6 +403,7 @@ async def import_audio_base_stream(request: Request) -> StreamingResponse:
                 _run_audio_base_import(
                     base_name=base_name,
                     files=files,
+                    language=language,
                     progress_callback=_emit,
                 )
             except ValueError as exc:
@@ -421,6 +440,7 @@ def import_audio_base_local_stream(payload: LocalAudioBaseImportRequest) -> Stre
                 _run_audio_base_import_from_folder(
                     base_name=payload.base_name,
                     folder_path=payload.folder_path,
+                    language=_normalize_import_language(payload.language),
                     progress_callback=_emit,
                 )
             except ValueError as exc:

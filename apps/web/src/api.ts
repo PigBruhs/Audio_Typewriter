@@ -233,9 +233,14 @@ export async function exportLexicon(baseName: string): Promise<LexiconExport> {
   return { fileName, content };
 }
 
-export async function importAudioBase(baseName: string, files: File[]): Promise<AudioBaseImportResponse> {
+export async function importAudioBase(
+  baseName: string,
+  files: File[],
+  language: "en" | "zh" = "en"
+): Promise<AudioBaseImportResponse> {
   const form = new FormData();
   form.append("base_name", baseName);
+  form.append("language", language);
   for (const file of files) {
     form.append("files", file, file.name);
   }
@@ -253,10 +258,12 @@ export async function importAudioBase(baseName: string, files: File[]): Promise<
 export async function importAudioBaseStream(
   baseName: string,
   files: File[],
+  language: "en" | "zh" = "en",
   onEvent: (event: ImportStreamEvent) => void
 ): Promise<AudioBaseImportResponse> {
   const form = new FormData();
   form.append("base_name", baseName);
+  form.append("language", language);
   for (const file of files) {
     form.append("files", file, file.name);
   }
@@ -326,6 +333,7 @@ export async function importAudioBaseStream(
 export async function importAudioBaseByPathStream(
   baseName: string,
   folderPath: string,
+  language: "en" | "zh",
   onEvent: (event: ImportStreamEvent) => void
 ): Promise<AudioBaseImportResponse> {
   const response = await fetch("/api/v1/audio-bases/import/local/stream", {
@@ -336,6 +344,7 @@ export async function importAudioBaseByPathStream(
     body: JSON.stringify({
       base_name: baseName,
       folder_path: folderPath,
+      language,
     }),
   });
   if (!response.ok) {

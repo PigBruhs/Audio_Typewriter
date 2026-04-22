@@ -8,6 +8,12 @@ set "BACKEND_SCRIPT=%ROOT%\start_backend.bat"
 set "WEB_SCRIPT=%ROOT%\start_web.bat"
 set "API_HEALTH=http://127.0.0.1:8000/api/v1/health"
 
+REM MFA placeholders (optional): fill these with your own local paths if you use MFA.
+REM 请网上搜索 "Montreal Forced Aligner Windows 安装教程"，完成安装后再填写。
+REM set "AT_ASR_MFA_BINARY=E:\path\to\mfa.exe"
+REM set "AT_ASR_MFA_DICTIONARY_PATH=E:\path\to\english_us_arpa.dict"
+REM set "AT_ASR_MFA_ACOUSTIC_MODEL_PATH=E:\path\to\english_us_arpa.zip"
+
 if not exist "%BACKEND_SCRIPT%" (
   echo [ERROR] Missing script: "%BACKEND_SCRIPT%"
   exit /b 1
@@ -27,6 +33,7 @@ if /I "%~1"=="--dry-run" (
 )
 
 echo [START] Launching backend...
+echo [INFO] 如需启用 MFA，请先在 start.bat 顶部填写 AT_ASR_MFA_* 路径。
 start "Audio_Typewriter_API" "%BACKEND_SCRIPT%"
 
 echo [WAIT] Waiting for backend health before launching frontend...

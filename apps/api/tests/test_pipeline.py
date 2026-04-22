@@ -11,7 +11,7 @@ from fastapi import UploadFile
 
 from app.core.config import Settings
 from app.db import SQLiteDatabase
-from app.models import AudioBaseFileRecord, AudioBaseRecord, AudioSourceRecord, MixPlanItem, WordOccurrenceRecord
+from app.models import AudioBaseFileRecord, AudioBaseRecord, AudioSourceRecord, IngestResult, MixPlanItem, WordOccurrenceRecord
 from app.services.asr_service import ASRService, ASRTranscriptionError
 from app.services.audio_base_service import AudioBaseService
 from app.services.index_service import IndexService
@@ -417,6 +417,112 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("ASR paused at seq=1", str(tasks[0]["last_error"]))
         self.assertIn("CPU fallback failed", str(tasks[0]["last_event"]))
 
+    def test_run_task_uses_task_asr_language_for_ingest(self) -> None:
+        queue_service = TaskQueueService(self.database, ASRService(self.settings), self.index_service, self.audio_base_service, self.settings)
+        with queue_service._condition:
+            queue_service._shutdown_requested = True
+            queue_service._condition.notify_all()
+
+        now = "2026-01-01T00:00:00+00:00"
+        self.database.create_audio_base(
+            AudioBaseRecord(
+                base_name="demo_zh",
+                base_path=str(self.settings.audio_base_dir / "demo_zh"),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        self.database.replace_audio_base_files(
+            "demo_zh",
+            [
+                AudioBaseFileRecord(
+                    source_audio_id="demo_zh:000001",
+                    base_name="demo_zh",
+                    sequence_number=1,
+                    file_name="000001.wav",
+                    file_path="audio_base/demo_zh/000001.wav",
+                    duration_sec=1.0,
+                    file_size_bytes=1,
+                    created_at=now,
+                )
+            ],
+        )
+
+        task = QueueTask(
+            task_id="task-asr-language",
+            base_name="demo_zh",
+            status="running",
+            total_files=1,
+            processed_files=0,
+            next_sequence_number=1,
+            token_count=0,
+            stage="asr",
+            ready_for_asr=True,
+            vad_total_audio_sec=1.0,
+            vad_processed_audio_sec=1.0,
+            vad_source_dir=None,
+            vad_source_paths=[],
+            vad_total_sources=0,
+            vad_next_source_index=1,
+            vad_next_segment_index=0,
+            vad_next_sequence_number=1,
+            vad_created_at=now,
+            asr_last_completed_sequence=0,
+            model_tier="large",
+            created_at=now,
+            updated_at=now,
+            asr_language="zh",
+        )
+
+        captured_languages: list[str] = []
+
+        def fake_ingest(*_args, **kwargs):
+            captured_languages.append(str(kwargs.get("language")))
+            return (
+                AudioSourceRecord(
+                    source_audio_id="demo_zh:000001",
+                    base_name="demo_zh",
+                    source_path="audio_base/demo_zh/000001.wav",
+                    language=str(kwargs.get("language") or ""),
+                    model_tier="large",
+                    device="cpu",
+                    compute_type="int8",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                [WordOccurrenceRecord(None, "demo_zh:000001", "你", "你", 0.0, 0.1, 0.9, 0, 0)],
+                IngestResult(
+                    source_audio_id="demo_zh:000001",
+                    base_name="demo_zh",
+                    status="completed",
+                    token_count=1,
+                    device_used="cpu",
+                    compute_type="int8",
+                ),
+            )
+
+        queue_service.asr_service.ingest = fake_ingest  # type: ignore[method-assign]
+
+        with queue_service._condition:
+            queue_service._tasks = [task]
+            queue_service._save_tasks()
+
+        queue_service._run_task(task)
+
+        self.assertEqual(captured_languages, ["zh"])
+        tasks = queue_service.list_tasks()
+        self.assertEqual(tasks[0]["status"], "completed")
+        connection = self.database.connect()
+        try:
+            row = connection.execute(
+                "SELECT language FROM audio_sources WHERE source_audio_id = ?",
+                ("demo_zh:000001",),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(str(row["language"]), "zh")
+
     def test_index_search_and_mix_plan(self) -> None:
         audio_source = AudioSourceRecord(
             source_audio_id="clip-a.wav",
@@ -476,6 +582,30 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("hello world again", lexicon["phrases"])
         self.assertIn("good day", lexicon["phrases"])
         self.assertEqual(lexicon["sentences"], ["good day", "hello world again"])
+
+    def test_export_lexicon_keeps_chinese_characters(self) -> None:
+        source = AudioSourceRecord(
+            source_audio_id="clip-zh.wav",
+            base_name="demo_zh",
+            source_path="clip-zh.wav",
+            language="zh",
+            model_tier="base",
+            device="cpu",
+            compute_type="int8",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        self.index_service.ingest(
+            source,
+            [
+                WordOccurrenceRecord(None, "clip-zh.wav", "你", "你", 0.0, 0.1, 0.9, 0, 0),
+                WordOccurrenceRecord(None, "clip-zh.wav", "好", "好", 0.1, 0.2, 0.9, 0, 1),
+                WordOccurrenceRecord(None, "clip-zh.wav", "吗", "吗", 0.2, 0.3, 0.9, 0, 2),
+            ],
+        )
+
+        lexicon = self.database.export_lexicon(base_name="demo_zh")
+        self.assertEqual(lexicon["words"], ["你", "吗", "好"])
 
     def test_mix_plan_prefers_whole_sentence_direct_pass(self) -> None:
         audio_source = AudioSourceRecord(

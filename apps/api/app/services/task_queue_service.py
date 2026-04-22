@@ -63,6 +63,7 @@ class QueueTask:
     asr_running_since: str | None = None
     asr_total_audio_sec: float = 0.0
     asr_processed_audio_sec: float = 0.0
+    asr_language: str = "en"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -99,6 +100,7 @@ class QueueTask:
             "asr_running_since": self.asr_running_since,
             "asr_total_audio_sec": self.asr_total_audio_sec,
             "asr_processed_audio_sec": self.asr_processed_audio_sec,
+            "asr_language": self.asr_language,
         }
 
     @staticmethod
@@ -138,6 +140,7 @@ class QueueTask:
             asr_running_since=(str(payload["asr_running_since"]) if payload.get("asr_running_since") else None),
             asr_total_audio_sec=float(payload.get("asr_total_audio_sec", 0.0)),
             asr_processed_audio_sec=float(payload.get("asr_processed_audio_sec", 0.0)),
+            asr_language=str(payload.get("asr_language", settings.asr_default_language) or settings.asr_default_language),
         )
 
 
@@ -305,6 +308,7 @@ class TaskQueueService:
         vad_total_audio_sec: float,
         task_id: str | None = None,
         model_tier: str = "large",
+        asr_language: str | None = None,
         overwritten: bool = False,
         cleared_audio_files: int = 0,
         cleared_index_sources: int = 0,
@@ -342,6 +346,7 @@ class TaskQueueService:
             asr_running_since=None,
             asr_total_audio_sec=0.0,
             asr_processed_audio_sec=0.0,
+            asr_language=(str(asr_language or self.settings.asr_default_language).strip().lower() or self.settings.asr_default_language),
         )
         with self._condition:
             self._tasks.append(task)
@@ -355,6 +360,7 @@ class TaskQueueService:
         base_name: str,
         task_id: str,
         model_tier: str = "large",
+        asr_language: str | None = None,
         overwritten: bool = False,
         cleared_audio_files: int = 0,
         cleared_index_sources: int = 0,
@@ -393,6 +399,7 @@ class TaskQueueService:
             asr_running_since=None,
             asr_total_audio_sec=0.0,
             asr_processed_audio_sec=0.0,
+            asr_language=(str(asr_language or self.settings.asr_default_language).strip().lower() or self.settings.asr_default_language),
         )
         with self._condition:
             self._tasks.append(task)
@@ -476,6 +483,7 @@ class TaskQueueService:
         base_name: str,
         total_files: int,
         model_tier: str = "large",
+        asr_language: str | None = None,
         task_id: str | None = None,
     ) -> dict[str, object]:
         now = self._now_iso()
@@ -509,6 +517,7 @@ class TaskQueueService:
             asr_running_since=None,
             asr_total_audio_sec=0.0,
             asr_processed_audio_sec=0.0,
+            asr_language=(str(asr_language or self.settings.asr_default_language).strip().lower() or self.settings.asr_default_language),
         )
         with self._condition:
             self._tasks.append(task)
@@ -850,7 +859,7 @@ class TaskQueueService:
                     source_path=record.file_path,
                     source_audio_id=record.source_audio_id,
                     base_name=record.base_name,
-                    language=self.settings.asr_default_language,
+                    language=(str(task.asr_language).strip().lower() or self.settings.asr_default_language),
                     model_tier=task.model_tier,
                     progress_callback=_on_asr_progress,
                 )

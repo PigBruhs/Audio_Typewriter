@@ -2,6 +2,8 @@
 
 Audio_Typewriter is a sentence-mixing toolkit: it transcribes speech to word-level timestamps, stores token references, and rebuilds new target sentences by stitching clips.
 
+- Chinese usage and safety notes: `docs/usage-and-notes-zh.md`
+
 ## Current MVP Scope
 
 - English-first word-level ASR ingestion.
