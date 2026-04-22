@@ -83,6 +83,11 @@ export type ReAsrResponse = {
   discarded_task_count: number;
 };
 
+export type LexiconExport = {
+  fileName: string;
+  content: string;
+};
+
 export type ImportStreamEvent =
   | { type: "status"; message: string }
   | { type: "task"; task: QueueTask }
@@ -117,6 +122,22 @@ async function readErrorDetail(response: Response): Promise<string> {
     // Fall back to HTTP status when body is not JSON.
   }
   return `HTTP ${response.status}`;
+}
+
+function parseDownloadFileName(contentDisposition: string | null, fallback: string): string {
+  if (!contentDisposition) {
+    return fallback;
+  }
+  const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch (_error) {
+      return utf8Match[1];
+    }
+  }
+  const plainMatch = contentDisposition.match(/filename="?([^";]+)"?/i);
+  return plainMatch?.[1] ?? fallback;
 }
 
 export async function requestMix(
@@ -199,6 +220,17 @@ export async function requestReAsr(baseName: string): Promise<ReAsrResponse> {
     throw new Error(`reASR failed: ${await readErrorDetail(response)}`);
   }
   return (await response.json()) as ReAsrResponse;
+}
+
+export async function exportLexicon(baseName: string): Promise<LexiconExport> {
+  const query = `?base_name=${encodeURIComponent(baseName)}`;
+  const response = await fetch(`/api/v1/lexicon/export${query}`);
+  if (!response.ok) {
+    throw new Error(`Export lexicon failed: ${await readErrorDetail(response)}`);
+  }
+  const content = await response.text();
+  const fileName = parseDownloadFileName(response.headers.get("content-disposition"), "lexicon.txt");
+  return { fileName, content };
 }
 
 export async function importAudioBase(baseName: string, files: File[]): Promise<AudioBaseImportResponse> {

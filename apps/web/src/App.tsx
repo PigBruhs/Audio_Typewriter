@@ -3,6 +3,7 @@ import {
   ApiError,
   AudioBaseItem,
   deleteQueueTask,
+  exportLexicon,
   getAudioBaseStats,
   getHealth,
   HealthResponse,
@@ -84,7 +85,7 @@ function App(): JSX.Element {
   const [mixMode, setMixMode] = useState<MixMode>("word_phrase_sentence");
   const [mixOutputMode, setMixOutputMode] = useState<MixOutputMode>("mix");
   const [tailExtensionMs, setTailExtensionMs] = useState(20);
-  const [segmentExpansionMs, setSegmentExpansionMs] = useState(500);
+  const [segmentExpansionMs, setSegmentExpansionMs] = useState(250);
   const [sentence, setSentence] = useState("");
   const [result, setResult] = useState<string>("");
   const [importResult, setImportResult] = useState<string>("");
@@ -95,6 +96,7 @@ function App(): JSX.Element {
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
   const [reasrLoading, setReasrLoading] = useState(false);
+  const [exportingLexicon, setExportingLexicon] = useState(false);
   const [exiting, setExiting] = useState(false);
   const previousTasksRef = useRef<Record<string, QueueTask>>({});
   const mixSpeedError = Number.isFinite(mixSpeed) && mixSpeed > 0 ? "" : tt("速度必须大于 0。", "Speed must be greater than 0.");
@@ -387,6 +389,34 @@ function App(): JSX.Element {
     }
   }
 
+  async function onExportLexicon(): Promise<void> {
+    if (!selectedBase) {
+      setResult(tt("请先选择一个音频库。", "Please select an audio base first."));
+      return;
+    }
+    setExportingLexicon(true);
+    try {
+      const data = await exportLexicon(selectedBase);
+      const blob = new Blob([data.content], { type: "text/plain;charset=utf-8" });
+      const href = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = href;
+      anchor.download = data.fileName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(href);
+      appendImportLog(`[SYSTEM] Lexicon exported for base=${selectedBase}: ${data.fileName}`);
+      setResult(tt("词库导出成功。", "Lexicon exported successfully."));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : tt("导出词库失败", "Export lexicon failed");
+      setResult(message);
+      appendImportLog(`[ERROR] ${message}`);
+    } finally {
+      setExportingLexicon(false);
+    }
+  }
+
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedBase) {
@@ -499,6 +529,9 @@ function App(): JSX.Element {
           </select>
           <button type="button" onClick={onReAsr} disabled={!selectedBase || reasrLoading}>
             {reasrLoading ? "reASR..." : "reASR"}
+          </button>
+          <button type="button" onClick={onExportLexicon} disabled={!selectedBase || exportingLexicon}>
+            {exportingLexicon ? tt("导出中...", "Exporting...") : tt("导出词库", "Export Lexicon")}
           </button>
         </div>
         {selectedStats && (

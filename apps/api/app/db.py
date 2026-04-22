@@ -720,3 +720,66 @@ class SQLiteDatabase:
             connection.close()
         return [{"token": str(row["token"]), "count": int(row["count"])} for row in rows]
 
+    def export_lexicon(
+        self,
+        *,
+        base_name: str | None = None,
+        phrase_min_words: int = 2,
+        phrase_max_words: int = 4,
+    ) -> dict[str, list[str]]:
+        min_words = max(2, int(phrase_min_words))
+        max_words = max(min_words, int(phrase_max_words))
+
+        connection = self.connect()
+        try:
+            if base_name:
+                rows = connection.execute(
+                    """
+                    SELECT wo.source_audio_id, wo.segment_index, wo.word_index,
+                           wo.normalized_token, wo.id
+                    FROM word_occurrences wo
+                    JOIN audio_sources src ON src.source_audio_id = wo.source_audio_id
+                    WHERE src.base_name = ?
+                    ORDER BY wo.source_audio_id ASC, wo.segment_index ASC, wo.word_index ASC, wo.id ASC
+                    """,
+                    (base_name,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT source_audio_id, segment_index, word_index, normalized_token, id
+                    FROM word_occurrences
+                    ORDER BY source_audio_id ASC, segment_index ASC, word_index ASC, id ASC
+                    """
+                ).fetchall()
+        finally:
+            connection.close()
+
+        words: set[str] = set()
+        phrases: set[str] = set()
+        sentences: set[str] = set()
+        segment_tokens: dict[tuple[str, int], list[str]] = {}
+
+        for row in rows:
+            normalized = str(row["normalized_token"] or "").strip()
+            if not normalized:
+                continue
+            words.add(normalized)
+            key = (str(row["source_audio_id"]), int(row["segment_index"]))
+            segment_tokens.setdefault(key, []).append(normalized)
+
+        for tokens in segment_tokens.values():
+            if not tokens:
+                continue
+            sentences.add(" ".join(tokens))
+            token_count = len(tokens)
+            for phrase_len in range(min_words, min(max_words, token_count) + 1):
+                for start_idx in range(0, token_count - phrase_len + 1):
+                    phrases.add(" ".join(tokens[start_idx : start_idx + phrase_len]))
+
+        return {
+            "words": sorted(words),
+            "phrases": sorted(phrases),
+            "sentences": sorted(sentences),
+        }
+

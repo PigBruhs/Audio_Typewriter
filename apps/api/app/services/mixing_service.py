@@ -366,7 +366,7 @@ class MixingService:
         *,
         base_name: str,
         output_path: str | Path | None = None,
-        segment_expansion_ms: int = 500,
+        segment_expansion_ms: int = 250,
     ) -> tuple[str, list[str]]:
         if not plan.items:
             raise ValueError("No mixable tokens were found.")
@@ -557,7 +557,7 @@ class MixingService:
         mix_mode: str = "word_phrase_sentence",
         tail_extension_ms: int = 20,
         output_mode: str = "mix",
-        segment_expansion_ms: int = 500,
+        segment_expansion_ms: int = 250,
     ) -> MixResult:
         plan = self.build_mix_plan(sentence, base_name=base_name, mix_mode=mix_mode)
         normalized_output_mode = str(output_mode or "mix").strip().lower()

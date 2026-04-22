@@ -446,6 +446,37 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(plan.items), 1)
         self.assertEqual(plan.items[0].token, "hello world")
 
+    def test_export_lexicon_returns_words_phrases_and_sentences(self) -> None:
+        source = AudioSourceRecord(
+            source_audio_id="clip-lexicon.wav",
+            base_name="demo_base",
+            source_path="clip-lexicon.wav",
+            language="en",
+            model_tier="base",
+            device="cpu",
+            compute_type="int8",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        self.index_service.ingest(
+            source,
+            [
+                WordOccurrenceRecord(None, "clip-lexicon.wav", "Hello", "hello", 0.0, 0.1, 0.9, 0, 0),
+                WordOccurrenceRecord(None, "clip-lexicon.wav", "world", "world", 0.1, 0.2, 0.9, 0, 1),
+                WordOccurrenceRecord(None, "clip-lexicon.wav", "again", "again", 0.2, 0.3, 0.9, 0, 2),
+                WordOccurrenceRecord(None, "clip-lexicon.wav", "good", "good", 0.4, 0.5, 0.9, 1, 0),
+                WordOccurrenceRecord(None, "clip-lexicon.wav", "day", "day", 0.5, 0.6, 0.9, 1, 1),
+            ],
+        )
+
+        lexicon = self.database.export_lexicon(base_name="demo_base")
+        self.assertEqual(lexicon["words"], ["again", "day", "good", "hello", "world"])
+        self.assertIn("hello world", lexicon["phrases"])
+        self.assertIn("world again", lexicon["phrases"])
+        self.assertIn("hello world again", lexicon["phrases"])
+        self.assertIn("good day", lexicon["phrases"])
+        self.assertEqual(lexicon["sentences"], ["good day", "hello world again"])
+
     def test_mix_plan_prefers_whole_sentence_direct_pass(self) -> None:
         audio_source = AudioSourceRecord(
             source_audio_id="clip-long.wav",

@@ -9,7 +9,7 @@ from queue import Empty, Queue
 from typing import Callable, cast
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
 try:
     from tqdm.auto import tqdm
@@ -545,6 +545,29 @@ def trigger_reasr(base_name: str) -> dict[str, object]:
         "purged_occurrences": int(purge_info.get("purged_occurrences", 0)),
         "discarded_task_count": int(discarded.get("discarded_tasks", 0)),
     }
+
+
+@router.get("/lexicon/export")
+def export_lexicon(base_name: str) -> PlainTextResponse:
+    normalized_base_name = _audio_base_service.validate_base_name(base_name)
+    if not _database.get_audio_base_stats(normalized_base_name):
+        raise HTTPException(status_code=404, detail=f"Audio base '{normalized_base_name}' was not found")
+
+    lexicon = _database.export_lexicon(base_name=normalized_base_name)
+    filename = f"lexicon_{normalized_base_name}.txt"
+
+    lines: list[str] = [
+        "# Audio Typewriter Lexicon",
+        f"# Scope: {normalized_base_name}",
+        "",
+        "[WORDS]",
+        *lexicon["words"],
+        "",
+    ]
+    return PlainTextResponse(
+        "\n".join(lines),
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/models/download", response_model=ModelDownloadResponse)

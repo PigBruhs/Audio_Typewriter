@@ -52,7 +52,7 @@ class MixRequest(BaseModel):
         description="mix: render a stitched sentence wav, segment_output: render per-segment wav files",
     )
     segment_expansion_ms: int = Field(
-        default=500,
+        default=250,
         ge=0,
         le=5000,
         description="For segment_output mode: expand both start/end by this amount when exporting each clip.",
